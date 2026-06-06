@@ -10,7 +10,7 @@ connectDB();
 const app = express();
 
 const allowedOrigins = [
-  'https://livetv-client.vercel.app',
+  'https://kriya-tv.vercel.app',
   'http://localhost:5173'
 ];
 
