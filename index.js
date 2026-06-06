@@ -1,9 +1,22 @@
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
+const connectDB = require('./config/db');
+
+// Connect to MongoDB
+connectDB();
 
 const app = express();
 app.use(cors());
+app.use(express.json());
+
+// Mount the Full-Stack API
+app.use('/api', require('./api'));
+
+// Initialize Background Automation Engine
+const { initCronJobs } = require('./cron');
+initCronJobs();
 
 // Health check / keep-alive ping endpoint
 app.get('/ping', (req, res) => {
@@ -12,13 +25,24 @@ app.get('/ping', (req, res) => {
 
 app.get('/proxy', async (req, res) => {
   const targetUrl = req.query.url;
+  const token = req.query.ptoken; // Proxy token
+  
   if (!targetUrl) return res.status(400).send('URL required');
+  
+  // Basic Anti-Theft: Require a static secret token from the frontend
+  if (token !== 'kriya_secure_play_2026') {
+    return res.status(403).send('Forbidden: Invalid Proxy Token. Hotlinking is not allowed.');
+  }
 
   try {
+    // Dynamically choose responseType: stream for video chunks, arraybuffer for playlists
+    const isSegment = targetUrl.match(/\.(ts|mp4|m4s|aac)$/i);
+    const reqResponseType = isSegment ? 'stream' : 'arraybuffer';
+
     const response = await axios({
       url: targetUrl,
       method: 'GET',
-      responseType: 'stream', // Use stream for zero-latency piping
+      responseType: reqResponseType,
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
         'Accept': '*/*',
@@ -33,50 +57,45 @@ app.get('/proxy', async (req, res) => {
     res.set('Access-Control-Allow-Origin', '*');
     res.set('Cache-Control', 'no-cache');
 
-    // If M3U8 playlist, buffer and rewrite URLs
     const isPlaylist =
       contentType.includes('mpegurl') ||
       contentType.includes('x-mpegURL') ||
       targetUrl.includes('.m3u8');
 
     if (isPlaylist) {
-      let text = '';
-      response.data.on('data', chunk => { text += chunk.toString('utf8'); });
-      
-      response.data.on('end', () => {
-        const baseUrl = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
-        const rewritten = text.split('\n').map(line => {
-          const trimmed = line.trim();
-          if (!trimmed) return '';
-          
-          if (trimmed.startsWith('#')) {
-            return trimmed.replace(/URI="([^"]+)"/g, (_, uri) => {
-              const abs = toAbsoluteUrl(uri, baseUrl, targetUrl);
-              return `URI="/proxy?url=${encodeURIComponent(abs)}"`;
-            });
-          }
-          
-          if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
-            return `/proxy?url=${encodeURIComponent(trimmed)}`;
-          }
-          
-          if (!trimmed.startsWith('#')) {
-            const abs = toAbsoluteUrl(trimmed, baseUrl, targetUrl);
-            return `/proxy?url=${encodeURIComponent(abs)}`;
-          }
-          
-          return trimmed;
-        }).join('\n');
-        
-        res.send(rewritten);
-      });
-      
-      response.data.on('error', (err) => {
-        res.status(502).send('Stream error');
-      });
-    } else {
-      // Binary stream (video segment) - PIPE DIRECTLY FOR ZERO LATENCY!
+      let text = response.data.toString('utf8');
+      const baseUrl = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
+
+      const rewritten = text.split('\n').map(line => {
+        const trimmed = line.trim();
+        if (!trimmed) return '';
+
+        if (trimmed.startsWith('#')) {
+          return trimmed.replace(/URI="([^"]+)"/g, (_, uri) => {
+            const abs = toAbsoluteUrl(uri, baseUrl, targetUrl);
+            return `URI="/proxy?url=${encodeURIComponent(abs)}&ptoken=${token}"`;
+          });
+        }
+
+        if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
+          return `/proxy?url=${encodeURIComponent(trimmed)}&ptoken=${token}`;
+        }
+
+        if (!trimmed.startsWith('#')) {
+          const abs = toAbsoluteUrl(trimmed, baseUrl, targetUrl);
+          return `/proxy?url=${encodeURIComponent(abs)}&ptoken=${token}`;
+        }
+
+        return trimmed;
+      }).join('\n');
+
+      return res.send(rewritten);
+    }
+
+    if (reqResponseType === 'stream') {
       response.data.pipe(res);
+    } else {
+      res.send(response.data);
     }
 
   } catch (err) {
@@ -94,7 +113,7 @@ function toAbsoluteUrl(uri, base, full) {
   return base + uri;
 }
 
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 5050;
 app.listen(PORT, () => {
   console.log(`Proxy server running on port ${PORT}`);
 });
