@@ -30,8 +30,8 @@ Make sure you have [Node.js](https://nodejs.org/) installed and a MongoDB databa
 2. Create a `.env` file and add the following:
    ```env
    PORT=5050
-   MONGO_URI=your_mongodb_connection_string
-   JWT_SECRET=your_super_secret_jwt_key
+   MONGO_URI=
+   JWT_SECRET=
    ```
 3. Start the backend server:
    ```bash
