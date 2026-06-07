@@ -126,9 +126,39 @@ router.put('/home-sections', authenticate, async (req, res) => {
 // CHANNELS (CRUD)
 // ========================
 
+const cache = {
+  channels: { data: null, lastFetch: 0 }
+};
+
+// Background worker to auto-fetch channels every 4 minutes.
+// This ensures the RAM always has fresh data BEFORE any user visits.
+const refreshCache = async () => {
+  try {
+    const channels = await Channel.find().select('-__v');
+    cache.channels.data = channels;
+    cache.channels.lastFetch = Date.now();
+  } catch (err) {
+    console.error("Cache refresh error:", err);
+  }
+};
+
+// Initial fetch when server starts
+refreshCache();
+// Refresh every 4 minutes automatically
+setInterval(refreshCache, 1000 * 60 * 4);
+
+const invalidateCache = () => {
+  refreshCache(); // Immediately fetch fresh data instead of just clearing
+};
+
 // Public: Get all channels (for frontend useChannels)
 router.get('/channels', async (req, res) => {
   try {
+    // If cache is ready, return instantly (1ms)
+    if (cache.channels.data) {
+      return res.json(cache.channels.data);
+    }
+    // Fallback if cache is somehow empty
     const channels = await Channel.find().select('-__v');
     res.json(channels);
   } catch (err) {
@@ -141,6 +171,7 @@ router.post('/channels', authenticate, async (req, res) => {
   try {
     const channel = new Channel(req.body);
     await channel.save();
+    invalidateCache();
     res.status(201).json(channel);
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
@@ -154,11 +185,11 @@ router.put('/channels/:id', authenticate, async (req, res) => {
     if (req.params.id.match(/^[0-9a-fA-F]{24}$/)) {
       channel = await Channel.findByIdAndUpdate(req.params.id, req.body, { new: true });
     } else {
-      // Fallback if ID is actually a name
       channel = await Channel.findOneAndUpdate({ name: req.params.id }, req.body, { new: true });
     }
     
     if (!channel) return res.status(404).json({ error: 'Channel not found' });
+    invalidateCache();
     res.json(channel);
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
@@ -176,6 +207,7 @@ router.delete('/channels/:id', authenticate, async (req, res) => {
     }
     
     if (!result) return res.status(404).json({ error: 'Channel not found' });
+    invalidateCache();
     res.json({ message: 'Channel deleted' });
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
