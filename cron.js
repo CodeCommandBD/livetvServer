@@ -15,34 +15,50 @@ const syncFromGitHub = async () => {
     const newChannels = res.data;
     if (!Array.isArray(newChannels)) return;
 
+    const existingChannels = await Channel.find({});
+    const channelMap = new Map();
+    for (const c of existingChannels) {
+      channelMap.set(c.name, c);
+    }
+
     let updatedCount = 0;
     let addedCount = 0;
+    const bulkOps = [];
 
     for (const ghChannel of newChannels) {
       if (!ghChannel.url) continue;
 
-      const existingChannel = await Channel.findOne({ name: ghChannel.name });
+      const existingChannel = channelMap.get(ghChannel.name);
       
       if (existingChannel) {
         // If the GitHub URL has a token (?e=) and it's different from our current one, update it.
         if (existingChannel.url !== ghChannel.url && ghChannel.url.includes('?e=')) {
-          existingChannel.url = ghChannel.url;
-          // Optionally reset status to live if it was dead and we got a new link
-          if (existingChannel.status === 'dead') {
-            existingChannel.status = 'live';
-          }
-          await existingChannel.save();
+          bulkOps.push({
+            updateOne: {
+              filter: { _id: existingChannel._id },
+              update: { 
+                $set: { 
+                  url: ghChannel.url,
+                  status: existingChannel.status === 'dead' ? 'live' : existingChannel.status
+                } 
+              }
+            }
+          });
           updatedCount++;
         }
       } else {
         // New channel found in GitHub!
-        const newCh = new Channel({
-          ...ghChannel,
-          addedViaSync: true
+        bulkOps.push({
+          insertOne: {
+            document: { ...ghChannel, addedViaSync: true }
+          }
         });
-        await newCh.save();
         addedCount++;
       }
+    }
+
+    if (bulkOps.length > 0) {
+      await Channel.bulkWrite(bulkOps);
     }
 
     console.log(`[Cron] Sync Complete: ${addedCount} added, ${updatedCount} updated.`);
