@@ -261,6 +261,8 @@ router.post('/audit/event', async (req, res) => {
   }
 });
 
+const axios = require('axios');
+
 // Real-time Channel Tracking Ping
 router.post('/analytics/ping', (req, res) => {
   const { channelName } = req.body;
@@ -269,6 +271,24 @@ router.post('/analytics/ping', (req, res) => {
   
   if (userIP && channelName && global.activeSessions) {
     global.activeSessions.set(userIP, { channelName, lastSeen: Date.now() });
+
+    // Background fetch for IP location if not cached
+    if (global.ipLocationCache && !global.ipLocationCache.has(userIP)) {
+      if (userIP === '127.0.0.1' || userIP === '::1' || userIP.startsWith('192.168.')) {
+        global.ipLocationCache.set(userIP, 'Localhost');
+      } else {
+        global.ipLocationCache.set(userIP, 'Fetching...');
+        axios.get(`http://ip-api.com/json/${userIP}`).then(resp => {
+          if (resp.data && resp.data.status === 'success') {
+            global.ipLocationCache.set(userIP, resp.data.city || resp.data.country);
+          } else {
+            global.ipLocationCache.set(userIP, 'Unknown');
+          }
+        }).catch(() => {
+          global.ipLocationCache.set(userIP, 'Unknown');
+        });
+      }
+    }
   }
   
   res.json({ success: true });

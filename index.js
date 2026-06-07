@@ -31,6 +31,7 @@ initCronJobs();
 global.serverStatus = 'online';
 const activeIps = new Map();
 global.activeSessions = new Map(); // IP -> { channelName, lastSeen }
+global.ipLocationCache = new Map(); // IP -> 'Dhaka'
 
 global.getActiveUsersCount = () => {
   const now = Date.now();
@@ -50,6 +51,15 @@ global.getActiveUsersCount = () => {
     }
   }
 
+  // Cleanup inactive IP locations
+  if (global.ipLocationCache) {
+    for (const [ip] of global.ipLocationCache.entries()) {
+      if (!global.activeSessions.has(ip) && !activeIps.has(ip)) {
+        global.ipLocationCache.delete(ip);
+      }
+    }
+  }
+
   return count;
 };
 
@@ -63,7 +73,10 @@ global.getChannelBreakdown = () => {
     
     // Format IP for display (e.g. ::ffff:192.168.1.1 -> 192.168.1.1)
     const displayIp = ip.replace(/^.*:/, '');
-    breakdown[session.channelName].ips.push(displayIp);
+    const location = global.ipLocationCache && global.ipLocationCache.get(ip);
+    const ipStr = location && location !== 'Unknown' && location !== 'Fetching...' ? `${displayIp} (${location})` : displayIp;
+    
+    breakdown[session.channelName].ips.push(ipStr);
   }
   return Object.entries(breakdown)
     .map(([name, data]) => ({ name, count: data.count, ips: data.ips }))
