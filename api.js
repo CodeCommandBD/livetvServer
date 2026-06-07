@@ -78,21 +78,64 @@ router.get('/trending', async (req, res) => {
   }
 });
 
+global.automationStatus = {
+  isSyncing: false,
+  isChecking: false,
+  syncMessage: null,
+  checkMessage: null
+};
+
+router.get('/automation/status', authenticate, (req, res) => {
+  res.json(global.automationStatus);
+});
+
 router.post('/automation/sync', authenticate, async (req, res) => {
   try {
-    const result = await syncFromGitHub();
-    res.json({ success: true, ...result });
+    if (global.automationStatus.isSyncing) return res.json({ success: true, message: 'Already syncing' });
+    
+    global.automationStatus.isSyncing = true;
+    global.automationStatus.syncMessage = null;
+    
+    // Run in background
+    syncFromGitHub().then(result => {
+      global.automationStatus.isSyncing = false;
+      if (result) {
+        global.automationStatus.syncMessage = `Success! Added ${result.addedCount} new channels, updated ${result.updatedCount} expired tokens.`;
+      } else {
+        global.automationStatus.syncMessage = 'Failed to sync. Please check server logs.';
+      }
+    }).catch(err => {
+      global.automationStatus.isSyncing = false;
+      global.automationStatus.syncMessage = 'Failed to sync: ' + err.message;
+    });
+
+    res.json({ success: true, message: 'Sync started' });
   } catch (err) {
-    res.status(500).json({ error: 'Sync failed' });
+    res.status(500).json({ error: 'Server error' });
   }
 });
 
 router.post('/automation/check-links', authenticate, async (req, res) => {
   try {
-    const result = await checkLinks();
-    res.json({ success: true, ...result });
+    if (global.automationStatus.isChecking) return res.json({ success: true, message: 'Already checking' });
+    
+    global.automationStatus.isChecking = true;
+    global.automationStatus.checkMessage = null;
+    
+    // Run in background
+    checkLinks().then(result => {
+      global.automationStatus.isChecking = false;
+      if (result) {
+        global.automationStatus.checkMessage = `Success! Checked ${result.checked} random channels, found and disabled ${result.deadCount} dead links.`;
+      }
+    }).catch(err => {
+      global.automationStatus.isChecking = false;
+      global.automationStatus.checkMessage = 'Failed to run check: ' + err.message;
+    });
+
+    res.json({ success: true, message: 'Check started' });
   } catch (err) {
-    res.status(500).json({ error: 'Check failed' });
+    res.status(500).json({ error: 'Server error' });
   }
 });
 
