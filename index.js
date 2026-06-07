@@ -44,6 +44,11 @@ global.getActiveUsersCount = () => {
   return count;
 };
 
+// Prevent memory leak by cleaning up old IPs every 2 minutes
+setInterval(() => {
+  global.getActiveUsersCount();
+}, 120000);
+
 // Health check / keep-alive ping endpoint
 app.get('/ping', (req, res) => {
   res.json({ status: 'ok', time: new Date().toISOString() });
