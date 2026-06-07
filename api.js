@@ -127,6 +127,8 @@ router.post('/automation/check-links', authenticate, async (req, res) => {
       global.automationStatus.isChecking = false;
       if (result) {
         global.automationStatus.checkMessage = `Success! Checked ${result.checked} random channels, found and disabled ${result.deadCount} dead links.`;
+      } else {
+        global.automationStatus.checkMessage = 'Failed to run link checker. Please check server logs.';
       }
     }).catch(err => {
       global.automationStatus.isChecking = false;

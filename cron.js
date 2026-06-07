@@ -2,6 +2,7 @@ const cron = require('node-cron');
 const axios = require('axios');
 
 const Channel = require('./models/Channel');
+const Audit = require('./models/Audit');
 
 const GITHUB_URL = 'https://raw.githubusercontent.com/SHAJON-404/iptv/refs/heads/main/app/data/channels.json';
 
@@ -13,7 +14,9 @@ const syncFromGitHub = async () => {
   try {
     const res = await axios.get(GITHUB_URL);
     const newChannels = res.data;
-    if (!Array.isArray(newChannels)) return;
+    if (!Array.isArray(newChannels)) {
+      throw new Error("Invalid JSON format from GitHub. Expected an array.");
+    }
 
     const existingChannels = await Channel.find({});
     const channelMap = new Map();
@@ -61,9 +64,12 @@ const syncFromGitHub = async () => {
       await Channel.bulkWrite(bulkOps);
     }
 
+    const message = `Added ${addedCount} new channels, updated ${updatedCount} expired tokens.`;
+    await new Audit({ type: 'AUTO_SYNC', channel: 'SYSTEM_BOT', metadata: { message, status: 'success' } }).save();
     console.log(`[Cron] Sync Complete: ${addedCount} added, ${updatedCount} updated.`);
     return { addedCount, updatedCount };
   } catch (err) {
+    await new Audit({ type: 'AUTO_SYNC', channel: 'SYSTEM_BOT', metadata: { message: err.message, status: 'error' } }).save().catch(()=>{});
     console.error('[Cron] GitHub Sync Failed:', err.message);
   }
 };
@@ -111,11 +117,13 @@ const checkLinks = async () => {
       }
     }
 
+    const message = `Checked ${batch.length} random channels, found ${deadCount} dead links.`;
+    await new Audit({ type: 'AUTO_CHECK', channel: 'SYSTEM_BOT', metadata: { message, status: 'success' } }).save();
     console.log(`[Cron] Link Checker Batch Complete. Found ${deadCount} dead links in this batch.`);
     return { checked: batch.length, deadCount };
   } catch (err) {
+    await new Audit({ type: 'AUTO_CHECK', channel: 'SYSTEM_BOT', metadata: { message: err.message, status: 'error' } }).save().catch(()=>{});
     console.error('[Cron] Link checker failed:', err.message);
-    return { checked: 0, deadCount: 0 };
   }
 };
 
