@@ -30,6 +30,7 @@ initCronJobs();
 // Global State for Kill Switch
 global.serverStatus = 'online';
 const activeIps = new Map();
+global.activeSessions = new Map(); // IP -> { channelName, lastSeen }
 
 global.getActiveUsersCount = () => {
   const now = Date.now();
@@ -41,7 +42,25 @@ global.getActiveUsersCount = () => {
       activeIps.delete(ip);
     }
   }
+
+  // Cleanup inactive channel sessions (timeout 45s since ping is 30s)
+  for (const [ip, session] of global.activeSessions.entries()) {
+    if (now - session.lastSeen > 45000) {
+      global.activeSessions.delete(ip);
+    }
+  }
+
   return count;
+};
+
+global.getChannelBreakdown = () => {
+  const breakdown = {};
+  for (const session of global.activeSessions.values()) {
+    breakdown[session.channelName] = (breakdown[session.channelName] || 0) + 1;
+  }
+  return Object.entries(breakdown)
+    .map(([name, count]) => ({ name, count }))
+    .sort((a, b) => b.count - a.count);
 };
 
 // Prevent memory leak by cleaning up old IPs every 2 minutes

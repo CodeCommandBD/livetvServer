@@ -218,17 +218,11 @@ router.delete('/channels/:id', authenticate, async (req, res) => {
 // SERVER CONTROL (KILL SWITCH)
 // ========================
 
-// Admin: Get server status
+// Admin: Get Basic Server Status & Viewers
 router.get('/admin/server-status', authenticate, async (req, res) => {
-  try {
-    const activeUsers = global.getActiveUsersCount ? global.getActiveUsersCount() : 0;
-    res.json({
-      status: global.serverStatus || 'online',
-      activeUsers
-    });
-  } catch (err) {
-    res.status(500).json({ error: 'Server error' });
-  }
+  const activeUsers = global.getActiveUsersCount ? global.getActiveUsersCount() : 0;
+  const breakdown = global.getChannelBreakdown ? global.getChannelBreakdown() : [];
+  res.json({ status: global.serverStatus || 'online', activeUsers, breakdown });
 });
 
 // Admin: Set server status
@@ -252,16 +246,31 @@ router.put('/admin/server-status', authenticate, async (req, res) => {
 // AUDIT & LOGS
 // ========================
 
-// Public: Log an event (PLAY_START, PLAY_ERROR)
+// Audit Event Logging
 router.post('/audit/event', async (req, res) => {
   try {
-    const { type, channel, error, duration, metadata } = req.body;
-    const audit = new Audit({ type, channel, error, duration, metadata });
+    const { type, channel, error } = req.body;
+    if (!type || !channel) return res.status(400).json({ error: 'Missing data' });
+    
+    const audit = new Audit({ type, channel, error });
     await audit.save();
-    res.status(201).json({ success: true });
+    
+    res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
   }
+});
+
+// Real-time Channel Tracking Ping
+router.post('/analytics/ping', (req, res) => {
+  const { channelName } = req.body;
+  const userIP = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+  
+  if (userIP && channelName && global.activeSessions) {
+    global.activeSessions.set(userIP, { channelName, lastSeen: Date.now() });
+  }
+  
+  res.json({ success: true });
 });
 
 // Admin: Get dashboard stats
