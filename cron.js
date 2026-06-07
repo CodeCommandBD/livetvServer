@@ -76,12 +76,19 @@ const checkLinks = async () => {
           continue;
         }
         
-        // Small timeout, HEAD request
-        await axios.head(channel.url, { timeout: 3000 });
+        // Use GET instead of HEAD because many IPTV servers block HEAD requests.
+        // Increase timeout to 8 seconds for slow servers.
+        // Add User-Agent to prevent bot-blocking.
+        await axios.get(channel.url, { 
+          timeout: 8000,
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+          }
+        });
       } catch (err) {
-        // If it's a 404 or 502, mark it as dead
-        // Also handle network errors (e.g. ENOTFOUND) as dead
-        if (!err.response || err.response.status === 404 || err.response.status >= 500) {
+        // Only mark as dead if it explicitly returns a 404 (Not Found) or 403 (Forbidden/Expired)
+        // Do NOT mark as dead for timeouts (ECONNABORTED) or generic 500s which could be temporary server lag
+        if (err.response && (err.response.status === 404 || err.response.status === 403 || err.response.status === 410)) {
           await Channel.findByIdAndUpdate(channel._id, { status: 'dead' });
           deadCount++;
         }
