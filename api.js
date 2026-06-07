@@ -264,7 +264,8 @@ router.post('/audit/event', async (req, res) => {
 // Real-time Channel Tracking Ping
 router.post('/analytics/ping', (req, res) => {
   const { channelName } = req.body;
-  const userIP = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+  const forwardedFor = req.headers['x-forwarded-for'];
+  const userIP = forwardedFor ? forwardedFor.split(',')[0].trim() : req.socket.remoteAddress;
   
   if (userIP && channelName && global.activeSessions) {
     global.activeSessions.set(userIP, { channelName, lastSeen: Date.now() });

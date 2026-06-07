@@ -55,11 +55,18 @@ global.getActiveUsersCount = () => {
 
 global.getChannelBreakdown = () => {
   const breakdown = {};
-  for (const session of global.activeSessions.values()) {
-    breakdown[session.channelName] = (breakdown[session.channelName] || 0) + 1;
+  for (const [ip, session] of global.activeSessions.entries()) {
+    if (!breakdown[session.channelName]) {
+      breakdown[session.channelName] = { count: 0, ips: [] };
+    }
+    breakdown[session.channelName].count++;
+    
+    // Format IP for display (e.g. ::ffff:192.168.1.1 -> 192.168.1.1)
+    const displayIp = ip.replace(/^.*:/, '');
+    breakdown[session.channelName].ips.push(displayIp);
   }
   return Object.entries(breakdown)
-    .map(([name, count]) => ({ name, count }))
+    .map(([name, data]) => ({ name, count: data.count, ips: data.ips }))
     .sort((a, b) => b.count - a.count);
 };
 
@@ -85,7 +92,8 @@ app.get('/proxy', async (req, res) => {
   }
 
   // Track Active Users
-  const userIP = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+  const forwardedFor = req.headers['x-forwarded-for'];
+  const userIP = forwardedFor ? forwardedFor.split(',')[0].trim() : req.socket.remoteAddress;
   if (userIP) {
     activeIps.set(userIP, Date.now());
   }
