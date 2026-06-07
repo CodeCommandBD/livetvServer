@@ -106,15 +106,13 @@ app.get('/proxy', async (req, res) => {
 
     if (isPlaylist) {
       let text = response.data.toString('utf8');
-      const baseUrl = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
-
       const rewritten = text.split('\n').map(line => {
         const trimmed = line.trim();
         if (!trimmed) return '';
 
         if (trimmed.startsWith('#')) {
           return trimmed.replace(/URI="([^"]+)"/g, (_, uri) => {
-            const abs = toAbsoluteUrl(uri, baseUrl, targetUrl);
+            const abs = toAbsoluteUrl(uri, targetUrl);
             return `URI="/proxy?url=${encodeURIComponent(abs)}&ptoken=${token}"`;
           });
         }
@@ -124,7 +122,7 @@ app.get('/proxy', async (req, res) => {
         }
 
         if (!trimmed.startsWith('#')) {
-          const abs = toAbsoluteUrl(trimmed, baseUrl, targetUrl);
+          const abs = toAbsoluteUrl(trimmed, targetUrl);
           return `/proxy?url=${encodeURIComponent(abs)}&ptoken=${token}`;
         }
 
@@ -147,12 +145,19 @@ app.get('/proxy', async (req, res) => {
   }
 });
 
-function toAbsoluteUrl(uri, base, full) {
+function toAbsoluteUrl(uri, full) {
   if (uri.startsWith('http://') || uri.startsWith('https://')) return uri;
-  if (uri.startsWith('/')) {
-    try { return new URL(uri, full).href; } catch { return uri; }
+  try {
+    return new URL(uri, full).href;
+  } catch {
+    // Fallback if URL parsing fails
+    const basePath = full.split('?')[0];
+    const base = basePath.substring(0, basePath.lastIndexOf('/') + 1);
+    if (uri.startsWith('/')) {
+       try { return new URL(uri, full).origin + uri; } catch { return uri; }
+    }
+    return base + uri;
   }
-  return base + uri;
 }
 
 const PORT = process.env.PORT || 5050;
