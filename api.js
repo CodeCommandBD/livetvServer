@@ -303,7 +303,7 @@ router.get('/admin/stats', authenticate, async (req, res) => {
       kpis: {
         totalChannels,
         totalViews,
-        streamErrors: totalErrors,
+        errorCount: totalErrors,
         deadLinksEstimate
       },
       viewsPerDay,
