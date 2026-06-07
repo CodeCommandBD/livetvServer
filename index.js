@@ -27,6 +27,23 @@ app.use('/api', require('./api'));
 const { initCronJobs } = require('./cron');
 initCronJobs();
 
+// Global State for Kill Switch
+global.serverStatus = 'online';
+const activeIps = new Map();
+
+global.getActiveUsersCount = () => {
+  const now = Date.now();
+  let count = 0;
+  for (const [ip, lastSeen] of activeIps.entries()) {
+    if (now - lastSeen < 60000) { // Active if seen in last 60 seconds
+      count++;
+    } else {
+      activeIps.delete(ip);
+    }
+  }
+  return count;
+};
+
 // Health check / keep-alive ping endpoint
 app.get('/ping', (req, res) => {
   res.json({ status: 'ok', time: new Date().toISOString() });
@@ -38,6 +55,17 @@ app.get('/proxy', async (req, res) => {
   
   if (!targetUrl) return res.status(400).send('URL required');
   
+  // Server Kill Switch Check
+  if (global.serverStatus === 'offline') {
+    return res.status(403).send('SERVER_OFFLINE');
+  }
+
+  // Track Active Users
+  const userIP = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+  if (userIP) {
+    activeIps.set(userIP, Date.now());
+  }
+
   // Basic Anti-Theft: Require a static secret token from the frontend
   if (token !== 'kriya_secure_play_2026') {
     return res.status(403).send('Forbidden: Invalid Proxy Token. Hotlinking is not allowed.');

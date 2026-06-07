@@ -215,6 +215,40 @@ router.delete('/channels/:id', authenticate, async (req, res) => {
 });
 
 // ========================
+// SERVER CONTROL (KILL SWITCH)
+// ========================
+
+// Admin: Get server status
+router.get('/admin/server-status', authenticate, async (req, res) => {
+  try {
+    const activeUsers = global.getActiveUsersCount ? global.getActiveUsersCount() : 0;
+    res.json({
+      status: global.serverStatus || 'online',
+      activeUsers
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Admin: Set server status
+router.put('/admin/server-status', authenticate, async (req, res) => {
+  try {
+    const { status, force } = req.body;
+    const activeUsers = global.getActiveUsersCount ? global.getActiveUsersCount() : 0;
+    
+    if (status === 'offline' && activeUsers > 0 && !force) {
+      return res.status(400).json({ error: 'Cannot turn off server while users are active' });
+    }
+    
+    global.serverStatus = status;
+    res.json({ status: global.serverStatus, activeUsers });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ========================
 // AUDIT & LOGS
 // ========================
 
