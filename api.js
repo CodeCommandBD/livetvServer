@@ -306,12 +306,47 @@ router.post('/audit/event', async (req, res) => {
     const { type, channel, error } = req.body;
     if (!type || !channel) return res.status(400).json({ error: 'Missing data' });
     
-    const audit = new Audit({ type, channel, error });
-    await audit.save();
-    
+    // Extract IP BEFORE responding (to ensure req.socket/headers are still available)
+    const forwardedFor = req.headers['x-forwarded-for'];
+    const userIP = forwardedFor ? forwardedFor.split(',')[0].trim() : req.socket.remoteAddress;
+
+    // Respond immediately so the client isn't blocked
     res.json({ success: true });
+
+    // Process asynchronously
+    
+    let location = 'Unknown Location';
+    
+    if (userIP) {
+      if (userIP === '127.0.0.1' || userIP === '::1' || userIP.startsWith('192.168.')) {
+        location = 'Localhost';
+      } else if (global.ipLocationCache && global.ipLocationCache.has(userIP)) {
+        location = global.ipLocationCache.get(userIP);
+      } else {
+        try {
+          const axios = require('axios');
+          const resp = await axios.get(`http://ip-api.com/json/${userIP}`, { timeout: 2000 });
+          if (resp.data && resp.data.status === 'success') {
+            location = resp.data.city ? `${resp.data.city}, ${resp.data.country}` : resp.data.country;
+            if (!global.ipLocationCache) global.ipLocationCache = new Map();
+            global.ipLocationCache.set(userIP, location);
+          }
+        } catch (e) {
+          // Ignore timeout or network errors
+        }
+      }
+    }
+
+    const audit = new Audit({ 
+      type, 
+      channel, 
+      error,
+      metadata: { ip: userIP, location }
+    });
+    await audit.save();
+
   } catch (err) {
-    res.status(500).json({ error: 'Server error' });
+    console.error('Audit Error:', err);
   }
 });
 
