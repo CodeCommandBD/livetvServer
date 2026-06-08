@@ -9,6 +9,7 @@ const Audit = require('./models/Audit');
 const Setting = require('./models/Setting');
 const Contact = require('./models/Contact');
 const { syncFromGitHub, checkLinks } = require('./cron');
+const redis = require('./config/redis');
 
 // We use the same JWT Secret from .env or fallback
 const JWT_SECRET = process.env.JWT_SECRET || 'kriya_tv_super_secret_admin_key_2026';
@@ -54,6 +55,11 @@ router.post('/admin/login', async (req, res) => {
 
 router.get('/trending', async (req, res) => {
   try {
+    if (redis) {
+      const cachedTrending = await redis.get('kriyatv:trending');
+      if (cachedTrending) return res.json(cachedTrending);
+    }
+
     // Calculate trending based on PLAY_START in last 24h using aggregation
     const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
     
@@ -72,6 +78,9 @@ router.get('/trending', async (req, res) => {
     // Sort channels by the trending order
     const sortedChannels = trendingNames.map(name => channels.find(c => c.name === name)).filter(Boolean);
     
+    if (redis) {
+      await redis.set('kriyatv:trending', sortedChannels, { ex: 300 }); // Cache for 5 mins
+    }
     res.json(sortedChannels);
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
@@ -147,8 +156,16 @@ router.post('/automation/check-links', authenticate, async (req, res) => {
 
 router.get('/home-sections', async (req, res) => {
   try {
+    if (redis) {
+      const cachedSections = await redis.get('kriyatv:homeSections');
+      if (cachedSections) return res.json(cachedSections);
+    }
     const setting = await Setting.findOne({ key: 'homeSections' });
-    res.json(setting ? setting.value : { cricket: [], football: [] });
+    const sections = setting ? setting.value : { cricket: [], football: [] };
+    if (redis) {
+      await redis.set('kriyatv:homeSections', sections, { ex: 3600 }); // Cache for 1 hour
+    }
+    res.json(sections);
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
   }
@@ -161,6 +178,7 @@ router.put('/home-sections', authenticate, async (req, res) => {
       { value: req.body },
       { new: true, upsert: true }
     );
+    if (redis) await redis.del('kriyatv:homeSections');
     res.json(updated.value);
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
@@ -171,40 +189,31 @@ router.put('/home-sections', authenticate, async (req, res) => {
 // CHANNELS (CRUD)
 // ========================
 
-const cache = {
-  channels: { data: null, lastFetch: 0 }
-};
-
-// Background worker to auto-fetch channels every 4 minutes.
-// This ensures the RAM always has fresh data BEFORE any user visits.
-const refreshCache = async () => {
-  try {
-    const channels = await Channel.find().select('-__v');
-    cache.channels.data = channels;
-    cache.channels.lastFetch = Date.now();
-  } catch (err) {
-    console.error("Cache refresh error:", err);
+const invalidateCache = async () => {
+  if (redis) {
+    try {
+      await redis.del('kriyatv:channels');
+      await redis.del('kriyatv:trending');
+    } catch (err) {
+      console.error('Redis cache invalidation error:', err.message);
+    }
   }
-};
-
-// Initial fetch when server starts
-refreshCache();
-// Refresh every 4 minutes automatically
-setInterval(refreshCache, 1000 * 60 * 4);
-
-const invalidateCache = () => {
-  refreshCache(); // Immediately fetch fresh data instead of just clearing
 };
 
 // Public: Get all channels (for frontend useChannels)
 router.get('/channels', async (req, res) => {
   try {
-    // If cache is ready, return instantly (1ms)
-    if (cache.channels.data) {
-      return res.json(cache.channels.data);
+    if (redis) {
+      const cachedChannels = await redis.get('kriyatv:channels');
+      if (cachedChannels) return res.json(cachedChannels);
     }
-    // Fallback if cache is somehow empty
+    
     const channels = await Channel.find().select('-__v');
+    
+    if (redis) {
+      await redis.set('kriyatv:channels', channels, { ex: 3600 }); // Cache for 1 hour
+    }
+    
     res.json(channels);
   } catch (err) {
     res.status(500).json({ error: 'Server error' });

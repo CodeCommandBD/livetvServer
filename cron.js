@@ -3,6 +3,7 @@ const axios = require('axios');
 
 const Channel = require('./models/Channel');
 const Audit = require('./models/Audit');
+const redis = require('./config/redis');
 
 const GITHUB_URL = 'https://raw.githubusercontent.com/SHAJON-404/iptv/refs/heads/main/app/data/channels.json';
 
@@ -62,6 +63,14 @@ const syncFromGitHub = async () => {
 
     if (bulkOps.length > 0) {
       await Channel.bulkWrite(bulkOps);
+      if (redis) {
+        try {
+          await redis.del('kriyatv:channels');
+          console.log('[Cron] Cleared Redis cache after sync.');
+        } catch (e) {
+          console.error('[Cron] Failed to clear Redis cache:', e.message);
+        }
+      }
     }
 
     const message = `Added ${addedCount} new channels, updated ${updatedCount} expired tokens.`;
