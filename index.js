@@ -35,32 +35,39 @@ global.ipLocationCache = new Map(); // IP -> 'Dhaka'
 
 global.getActiveUsersCount = () => {
   const now = Date.now();
-  let count = 0;
+  
   for (const [ip, lastSeen] of activeIps.entries()) {
-    if (now - lastSeen < 60000) { // Active if seen in last 60 seconds
-      count++;
-    } else {
+    if (now - lastSeen > 60000) { 
       activeIps.delete(ip);
     }
   }
 
-  // Cleanup inactive channel sessions (timeout 45s since ping is 30s)
-  for (const [ip, session] of global.activeSessions.entries()) {
-    if (now - session.lastSeen > 45000) {
-      global.activeSessions.delete(ip);
+  // Cleanup inactive channel sessions (timeout 90s to prevent background tab throttling drops)
+  if (global.activeSessions) {
+    for (const [ip, session] of global.activeSessions.entries()) {
+      if (now - session.lastSeen > 90000) {
+        global.activeSessions.delete(ip);
+      }
     }
   }
+
+  // Combine unique IPs from both trackers
+  const uniqueIps = new Set();
+  if (global.activeSessions) {
+    for (const ip of global.activeSessions.keys()) uniqueIps.add(ip);
+  }
+  for (const ip of activeIps.keys()) uniqueIps.add(ip);
 
   // Cleanup inactive IP locations
   if (global.ipLocationCache) {
     for (const [ip] of global.ipLocationCache.entries()) {
-      if (!global.activeSessions.has(ip) && !activeIps.has(ip)) {
+      if (!uniqueIps.has(ip)) {
         global.ipLocationCache.delete(ip);
       }
     }
   }
 
-  return count;
+  return uniqueIps.size;
 };
 
 global.getChannelBreakdown = () => {
