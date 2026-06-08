@@ -423,8 +423,8 @@ router.post('/audit/event', async (req, res) => {
 
 const axios = require('axios');
 
-// Real-time Channel Tracking Ping
-router.post('/analytics/ping', (req, res) => {
+// Real-time Channel Tracking Heartbeat
+router.post('/stream/heartbeat', (req, res) => {
   const { channelName } = req.body;
   const forwardedFor = req.headers['x-forwarded-for'];
   const userIP = forwardedFor ? forwardedFor.split(',')[0].trim() : req.socket.remoteAddress;
