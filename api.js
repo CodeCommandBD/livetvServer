@@ -160,6 +160,7 @@ let matchClients = [];
 const notifyMatchUpdate = () => {
   matchClients.forEach(client => client.write(`data: update\n\n`));
 };
+global.notifyMatchUpdate = notifyMatchUpdate;
 
 router.get('/matches/stream', (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');

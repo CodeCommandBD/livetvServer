@@ -3,6 +3,7 @@ const axios = require('axios');
 
 const Channel = require('./models/Channel');
 const Audit = require('./models/Audit');
+const Match = require('./models/Match');
 const redis = require('./config/redis');
 
 const GITHUB_URL = 'https://raw.githubusercontent.com/SHAJON-404/iptv/refs/heads/main/app/data/channels.json';
@@ -137,6 +138,88 @@ const checkLinks = async () => {
 };
 
 // ==========================================
+// 3. AUTO START MATCHES (Runs every 1 min)
+// ==========================================
+const autoStartMatches = async () => {
+  try {
+    const now = new Date();
+    // Find all upcoming matches whose start time has passed
+    const matchesToStart = await Match.find({
+      status: 'UPCOMING',
+      startTime: { $lte: now }
+    });
+
+    if (matchesToStart.length > 0) {
+      console.log(`[Cron] Auto-starting ${matchesToStart.length} matches...`);
+      
+      const bulkOps = matchesToStart.map(match => ({
+        updateOne: {
+          filter: { _id: match._id },
+          update: { $set: { status: 'LIVE' } }
+        }
+      }));
+
+      await Match.bulkWrite(bulkOps);
+      
+      // Notify clients to refresh matches list instantly via SSE
+      if (global.notifyMatchUpdate) {
+        global.notifyMatchUpdate();
+      }
+      
+      console.log(`[Cron] Successfully updated ${matchesToStart.length} matches to LIVE.`);
+    }
+  } catch (err) {
+    console.error('[Cron] Auto Start Matches Failed:', err.message);
+  }
+};
+
+// ==========================================
+// 4. AUTO END MATCHES (Runs every 10 mins)
+// ==========================================
+const autoEndMatches = async () => {
+  try {
+    const now = new Date();
+    
+    // Find all LIVE matches
+    const liveMatches = await Match.find({ status: 'LIVE' });
+    if (liveMatches.length === 0) return;
+
+    const bulkOps = [];
+    let endedCount = 0;
+
+    for (const match of liveMatches) {
+      const durationMs = now - match.startTime;
+      const durationHours = durationMs / (1000 * 60 * 60);
+
+      // Define max safe duration based on sport
+      let maxHours = 4; // Default 4 hours
+      if (match.sport === 'FOOTBALL') maxHours = 3; // 3 hours max for football
+      if (match.sport === 'CRICKET') maxHours = 8; // 8 hours max to cover ODIs
+
+      if (durationHours >= maxHours) {
+        bulkOps.push({
+          updateOne: {
+            filter: { _id: match._id },
+            update: { $set: { status: 'ENDED' } }
+          }
+        });
+        endedCount++;
+      }
+    }
+
+    if (bulkOps.length > 0) {
+      await Match.bulkWrite(bulkOps);
+      if (global.notifyMatchUpdate) {
+        global.notifyMatchUpdate();
+      }
+      console.log(`[Cron] Successfully auto-ended ${endedCount} matches.`);
+    }
+  } catch (err) {
+    console.error('[Cron] Auto End Matches Failed:', err.message);
+  }
+};
+
+// ==========================================
 // INITIALIZE CRON JOBS
 // ==========================================
 const initCronJobs = () => {
@@ -145,6 +228,12 @@ const initCronJobs = () => {
   
   // Run Link Checker every 10 minutes
   cron.schedule('*/10 * * * *', checkLinks);
+
+  // Check and auto-start upcoming matches every 1 minute
+  cron.schedule('* * * * *', autoStartMatches);
+  
+  // Check and auto-end old live matches every 10 minutes
+  cron.schedule('*/10 * * * *', autoEndMatches);
   
   console.log('[Cron] Background jobs initialized.');
 };
@@ -152,5 +241,7 @@ const initCronJobs = () => {
 module.exports = {
   initCronJobs,
   syncFromGitHub,
-  checkLinks
+  checkLinks,
+  autoStartMatches,
+  autoEndMatches
 };
