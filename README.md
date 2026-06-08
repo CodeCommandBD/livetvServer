@@ -1,6 +1,6 @@
-# Kriya TV 📺 - Backend Server
+# NexPlay TV 📺 - Backend Server
 
-This is the backend server for Kriya TV. It serves as the API and a secure proxy for streaming HLS (`.m3u8`) files without exposing the source URL, thus avoiding CORS issues.
+This is the backend server for NexPlay TV. It serves as the API and a secure proxy for streaming HLS (`.m3u8`) files without exposing the source URL, thus avoiding CORS issues.
 
 ## 🚀 Key Features
 

@@ -6,13 +6,14 @@ const jwt = require('jsonwebtoken');
 const Admin = require('./models/Admin');
 const Channel = require('./models/Channel');
 const Audit = require('./models/Audit');
+const Match = require('./models/Match');
 const Setting = require('./models/Setting');
 const Contact = require('./models/Contact');
 const { syncFromGitHub, checkLinks } = require('./cron');
 const redis = require('./config/redis');
 
 // We use the same JWT Secret from .env or fallback
-const JWT_SECRET = process.env.JWT_SECRET || 'kriya_tv_super_secret_admin_key_2026';
+const JWT_SECRET = process.env.JWT_SECRET || 'nexplay_tv_super_secret_admin_key_2026';
 
 // Middleware to verify JWT
 const authenticate = (req, res, next) => {
@@ -56,7 +57,7 @@ router.post('/admin/login', async (req, res) => {
 router.get('/trending', async (req, res) => {
   try {
     if (redis) {
-      const cachedTrending = await redis.get('kriyatv:trending');
+      const cachedTrending = await redis.get('nexplaytv:trending');
       if (cachedTrending) return res.json(cachedTrending);
     }
 
@@ -79,7 +80,7 @@ router.get('/trending', async (req, res) => {
     const sortedChannels = trendingNames.map(name => channels.find(c => c.name === name)).filter(Boolean);
     
     if (redis) {
-      await redis.set('kriyatv:trending', sortedChannels, { ex: 300 }); // Cache for 5 mins
+      await redis.set('nexplaytv:trending', sortedChannels, { ex: 300 }); // Cache for 5 mins
     }
     res.json(sortedChannels);
   } catch (err) {
@@ -151,19 +152,89 @@ router.post('/automation/check-links', authenticate, async (req, res) => {
 });
 
 // ========================
+// MATCHES (Live & Upcoming)
+// ========================
+
+let matchClients = [];
+
+const notifyMatchUpdate = () => {
+  matchClients.forEach(client => client.write(`data: update\n\n`));
+};
+
+router.get('/matches/stream', (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  
+  // Send initial heartbeat
+  res.write(`data: connected\n\n`);
+
+  matchClients.push(res);
+
+  req.on('close', () => {
+    matchClients = matchClients.filter(c => c !== res);
+  });
+});
+
+router.get('/matches', async (req, res) => {
+  try {
+    const query = req.query.all === 'true' ? {} : { status: { $ne: 'ENDED' } };
+    const matches = await Match.find(query).sort({ startTime: 1 });
+    res.json(matches);
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+router.post('/admin/matches', authenticate, async (req, res) => {
+  try {
+    const match = new Match(req.body);
+    await match.save();
+    notifyMatchUpdate();
+    res.status(201).json(match);
+  } catch (err) {
+    console.error("Match save error:", err);
+    res.status(500).json({ error: err.message || 'Server error' });
+  }
+});
+
+router.put('/admin/matches/:id', authenticate, async (req, res) => {
+  try {
+    const match = await Match.findByIdAndUpdate(req.params.id, req.body, { new: true });
+    if (!match) return res.status(404).json({ error: 'Match not found' });
+    notifyMatchUpdate();
+    res.json(match);
+  } catch (err) {
+    console.error("Match update error:", err);
+    res.status(500).json({ error: err.message || 'Server error' });
+  }
+});
+
+router.delete('/admin/matches/:id', authenticate, async (req, res) => {
+  try {
+    const match = await Match.findByIdAndDelete(req.params.id);
+    if (!match) return res.status(404).json({ error: 'Match not found' });
+    notifyMatchUpdate();
+    res.json({ message: 'Match deleted' });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ========================
 // HOME SECTIONS (Admin Layout Manager)
 // ========================
 
 router.get('/home-sections', async (req, res) => {
   try {
     if (redis) {
-      const cachedSections = await redis.get('kriyatv:homeSections');
+      const cachedSections = await redis.get('nexplaytv:homeSections');
       if (cachedSections) return res.json(cachedSections);
     }
     const setting = await Setting.findOne({ key: 'homeSections' });
     const sections = setting ? setting.value : { cricket: [], football: [] };
     if (redis) {
-      await redis.set('kriyatv:homeSections', sections, { ex: 3600 }); // Cache for 1 hour
+      await redis.set('nexplaytv:homeSections', sections, { ex: 3600 }); // Cache for 1 hour
     }
     res.json(sections);
   } catch (err) {
@@ -178,7 +249,7 @@ router.put('/home-sections', authenticate, async (req, res) => {
       { value: req.body },
       { new: true, upsert: true }
     );
-    if (redis) await redis.del('kriyatv:homeSections');
+    if (redis) await redis.del('nexplaytv:homeSections');
     res.json(updated.value);
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
@@ -192,8 +263,8 @@ router.put('/home-sections', authenticate, async (req, res) => {
 const invalidateCache = async () => {
   if (redis) {
     try {
-      await redis.del('kriyatv:channels');
-      await redis.del('kriyatv:trending');
+      await redis.del('nexplaytv:channels');
+      await redis.del('nexplaytv:trending');
     } catch (err) {
       console.error('Redis cache invalidation error:', err.message);
     }
@@ -204,14 +275,14 @@ const invalidateCache = async () => {
 router.get('/channels', async (req, res) => {
   try {
     if (redis) {
-      const cachedChannels = await redis.get('kriyatv:channels');
+      const cachedChannels = await redis.get('nexplaytv:channels');
       if (cachedChannels) return res.json(cachedChannels);
     }
     
     const channels = await Channel.find().select('-__v');
     
     if (redis) {
-      await redis.set('kriyatv:channels', channels, { ex: 3600 }); // Cache for 1 hour
+      await redis.set('nexplaytv:channels', channels, { ex: 3600 }); // Cache for 1 hour
     }
     
     res.json(channels);

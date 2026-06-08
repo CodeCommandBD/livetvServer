@@ -65,7 +65,7 @@ const syncFromGitHub = async () => {
       await Channel.bulkWrite(bulkOps);
       if (redis) {
         try {
-          await redis.del('kriyatv:channels');
+          await redis.del('nexplaytv:channels');
           console.log('[Cron] Cleared Redis cache after sync.');
         } catch (e) {
           console.error('[Cron] Failed to clear Redis cache:', e.message);

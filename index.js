@@ -10,7 +10,7 @@ connectDB();
 const app = express();
 
 const allowedOrigins = [
-  'https://kriya-tv.vercel.app',
+  'https://nexplay-tv.vercel.app',
   'http://localhost:5173'
 ];
 
@@ -112,7 +112,7 @@ app.get('/proxy', async (req, res) => {
   }
 
   // Basic Anti-Theft: Require a static secret token from the frontend
-  if (token !== 'kriya_secure_play_2026') {
+  if (token !== 'nexplay_secure_play_2026') {
     return res.status(403).send('Forbidden: Invalid Proxy Token. Hotlinking is not allowed.');
   }
 
