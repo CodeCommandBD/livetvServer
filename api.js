@@ -233,7 +233,8 @@ router.get('/home-sections', async (req, res) => {
       if (cachedSections) return res.json(cachedSections);
     }
     const setting = await Setting.findOne({ key: 'homeSections' });
-    const sections = setting ? setting.value : { cricket: [], football: [] };
+    const defaultSections = { cricket: [], football: [], watchRecommended: [] };
+    const sections = setting ? { ...defaultSections, ...setting.value } : defaultSections;
     if (redis) {
       await redis.set('nexplaytv:homeSections', sections, { ex: 3600 }); // Cache for 1 hour
     }
