@@ -223,8 +223,8 @@ const autoEndMatches = async () => {
 // INITIALIZE CRON JOBS
 // ==========================================
 const initCronJobs = () => {
-  // Run GitHub Sync every midnight Bangladesh Time (00:00 BD / 18:00 UTC)
-  cron.schedule('0 0 * * *', syncFromGitHub, {
+  // Run GitHub Sync twice a day (Midnight 12:00 AM and Noon 12:00 PM BD Time)
+  cron.schedule('0 0,12 * * *', syncFromGitHub, {
     timezone: "Asia/Dhaka"
   });
   
