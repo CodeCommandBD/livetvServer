@@ -36,15 +36,22 @@ const syncFromGitHub = async () => {
       const existingChannel = channelMap.get(ghChannel.name);
       
       if (existingChannel) {
-        // If the GitHub URL has a token (?e=) and it's different from our current one, update it.
-        if (existingChannel.url !== ghChannel.url && ghChannel.url.includes('?e=')) {
+        // Sync any changes from GitHub (URL, Logo, Group) to the database
+        if (
+          existingChannel.url !== ghChannel.url ||
+          existingChannel.logo !== ghChannel.logo ||
+          existingChannel.group !== ghChannel.group
+        ) {
           bulkOps.push({
             updateOne: {
               filter: { _id: existingChannel._id },
               update: { 
                 $set: { 
                   url: ghChannel.url,
-                  status: existingChannel.status === 'dead' ? 'live' : existingChannel.status
+                  logo: ghChannel.logo || existingChannel.logo,
+                  group: ghChannel.group || existingChannel.group,
+                  // If URL changed, assume it might be live again and reset dead status
+                  status: existingChannel.url !== ghChannel.url && existingChannel.status === 'dead' ? 'live' : existingChannel.status
                 } 
               }
             }
@@ -100,30 +107,47 @@ const checkLinks = async () => {
 
     let deadCount = 0;
 
-    for (const channel of batch) {
+    // Process all 50 channels concurrently instead of sequentially!
+    // This reduces check time from 6+ minutes down to max 8 seconds.
+    const checks = batch.map(async (channel) => {
       try {
         if (!channel.url || !channel.url.startsWith('http')) {
           await Channel.findByIdAndUpdate(channel._id, { status: 'dead' });
           deadCount++;
-          continue;
+          return;
         }
         
-        // Use GET instead of HEAD because many IPTV servers block HEAD requests.
-        // Increase timeout to 8 seconds for slow servers.
-        // Add User-Agent to prevent bot-blocking.
-        await axios.get(channel.url, { 
+        const startPing = Date.now();
+        const response = await axios.get(channel.url, { 
           timeout: 8000,
+          responseType: 'stream',
           headers: {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
           }
         });
+        
+        if (response.data && typeof response.data.destroy === 'function') {
+          response.data.destroy();
+        }
+        
+        const latency = Date.now() - startPing;
+        await Channel.findByIdAndUpdate(channel._id, { status: 'live', ping: latency });
       } catch (err) {
-        // Only mark as dead if it explicitly returns a 404 (Not Found) or 403 (Forbidden/Expired)
-        // Do NOT mark as dead for timeouts (ECONNABORTED) or generic 500s which could be temporary server lag
         if (err.response && (err.response.status === 404 || err.response.status === 403 || err.response.status === 410)) {
           await Channel.findByIdAndUpdate(channel._id, { status: 'dead' });
           deadCount++;
         }
+      }
+    });
+
+    await Promise.all(checks);
+
+    // CRITICAL: Clear Redis Cache so frontend users instantly see the Dead/Live status and Ping updates!
+    if (redis) {
+      try {
+        await redis.del('nexplaytv:channels');
+      } catch (e) {
+        console.error('[Cron] Failed to clear Redis cache:', e.message);
       }
     }
 
