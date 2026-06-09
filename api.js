@@ -172,7 +172,14 @@ router.get('/matches/stream', (req, res) => {
 
   matchClients.push(res);
 
+  // Send a keep-alive comment every 30 seconds to prevent reverse proxies (Render/Nginx)
+  // from closing the connection due to idle timeout!
+  const keepAliveId = setInterval(() => {
+    res.write(`:\n\n`); 
+  }, 30000);
+
   req.on('close', () => {
+    clearInterval(keepAliveId);
     matchClients = matchClients.filter(c => c !== res);
   });
 });
@@ -201,7 +208,9 @@ router.post('/admin/matches', authenticate, async (req, res) => {
 
 router.put('/admin/matches/:id', authenticate, async (req, res) => {
   try {
-    const match = await Match.findByIdAndUpdate(req.params.id, req.body, { new: true });
+    // CRITICAL SECURITY FIX: Mongoose Schema Validation Bypass Protection
+    // Enforce runValidators: true so that updates do not bypass schema rules (e.g. required fields, enums).
+    const match = await Match.findByIdAndUpdate(req.params.id, req.body, { new: true, runValidators: true });
     if (!match) return res.status(404).json({ error: 'Match not found' });
     notifyMatchUpdate();
     res.json(match);
@@ -293,6 +302,48 @@ router.get('/channels', async (req, res) => {
   }
 });
 
+// Admin: Get all channels (Bypass Redis Cache for fresh stats like reactionsCount, supports pagination)
+router.get('/admin/channels', authenticate, async (req, res) => {
+  try {
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 20;
+    const search = req.query.search || '';
+    const status = req.query.status || 'all';
+
+    let query = {};
+    if (search) {
+      query.$or = [
+        { name: { $regex: search, $options: 'i' } },
+        { group: { $regex: search, $options: 'i' } }
+      ];
+    }
+    
+    if (status !== 'all') {
+      if (status === 'live') {
+        query.status = { $ne: 'dead' };
+      } else if (status === 'dead') {
+        query.status = 'dead';
+      }
+    }
+
+    const skip = (page - 1) * limit;
+
+    const [channels, total] = await Promise.all([
+      Channel.find(query).select('-__v').sort({ _id: -1 }).skip(skip).limit(limit),
+      Channel.countDocuments(query)
+    ]);
+
+    res.json({
+      data: channels,
+      total,
+      page,
+      totalPages: Math.ceil(total / limit)
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 // Admin: Add a channel
 router.post('/channels', authenticate, async (req, res) => {
   try {
@@ -309,10 +360,13 @@ router.post('/channels', authenticate, async (req, res) => {
 router.put('/channels/:id', authenticate, async (req, res) => {
   try {
     let channel;
+    // CRITICAL SECURITY FIX: Mongoose Schema Validation Bypass Protection
+    // By default, findByIdAndUpdate completely ignores Schema validations!
+    // We MUST use runValidators: true to prevent saving empty names or invalid URLs.
     if (req.params.id.match(/^[0-9a-fA-F]{24}$/)) {
-      channel = await Channel.findByIdAndUpdate(req.params.id, req.body, { new: true });
+      channel = await Channel.findByIdAndUpdate(req.params.id, req.body, { new: true, runValidators: true });
     } else {
-      channel = await Channel.findOneAndUpdate({ name: req.params.id }, req.body, { new: true });
+      channel = await Channel.findOneAndUpdate({ name: req.params.id }, req.body, { new: true, runValidators: true });
     }
     
     if (!channel) return res.status(404).json({ error: 'Channel not found' });
@@ -427,12 +481,12 @@ const axios = require('axios');
 
 // Real-time Channel Tracking Heartbeat
 router.post('/stream/heartbeat', (req, res) => {
-  const { channelName } = req.body;
+  const { channelName, clientId } = req.body;
   const forwardedFor = req.headers['x-forwarded-for'];
   const userIP = forwardedFor ? forwardedFor.split(',')[0].trim() : req.socket.remoteAddress;
   
-  if (userIP && channelName && global.activeSessions) {
-    global.activeSessions.set(userIP, { channelName, lastSeen: Date.now() });
+  if (userIP && channelName && clientId && global.activeSessions) {
+    global.activeSessions.set(clientId, { ip: userIP, channelName, lastSeen: Date.now() });
 
     // Background fetch for IP location if not cached
     if (global.ipLocationCache && !global.ipLocationCache.has(userIP)) {
@@ -465,6 +519,10 @@ router.get('/admin/stats', authenticate, async (req, res) => {
 
     const deadLinksEstimate = await Channel.countDocuments({ status: 'dead' });
 
+    // Total Reactions across all channels
+    const totalReactionsRaw = await Channel.aggregate([{ $group: { _id: null, total: { $sum: "$reactionsCount" } } }]);
+    const totalReactions = totalReactionsRaw.length > 0 ? totalReactionsRaw[0].total : 0;
+
     // Views by day for last 7 days
     const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
     const viewsByDayRaw = await Audit.aggregate([
@@ -496,7 +554,8 @@ router.get('/admin/stats', authenticate, async (req, res) => {
         totalChannels,
         totalViews,
         errorCount: totalErrors,
-        deadLinksEstimate
+        deadLinksEstimate,
+        totalReactions
       },
       viewsPerDay,
       topChannels
