@@ -223,8 +223,10 @@ const autoEndMatches = async () => {
 // INITIALIZE CRON JOBS
 // ==========================================
 const initCronJobs = () => {
-  // Run GitHub Sync every midnight
-  cron.schedule('0 0 * * *', syncFromGitHub);
+  // Run GitHub Sync every midnight Bangladesh Time (00:00 BD / 18:00 UTC)
+  cron.schedule('0 0 * * *', syncFromGitHub, {
+    timezone: "Asia/Dhaka"
+  });
   
   // Run Link Checker every 10 minutes
   cron.schedule('*/10 * * * *', checkLinks);
