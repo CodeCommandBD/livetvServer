@@ -599,6 +599,37 @@ router.get('/admin/audits', authenticate, async (req, res) => {
   }
 });
 
+// Admin: Get full details for a specific IP address
+router.get('/admin/ip-details/:ip', authenticate, async (req, res) => {
+  try {
+    const ip = req.params.ip;
+    const logs = await Audit.find({ 'metadata.ip': ip }).sort({ timestamp: -1 });
+
+    const channels = [...new Set(logs.map(l => l.channel).filter(Boolean))];
+    const firstSeen = logs.length > 0 ? logs[logs.length - 1].timestamp : null;
+    const lastSeen  = logs.length > 0 ? logs[0].timestamp : null;
+    const location  = logs.find(l => l.metadata?.location)?.metadata?.location || 'Unknown';
+
+    const eventBreakdown = logs.reduce((acc, l) => {
+      acc[l.type] = (acc[l.type] || 0) + 1;
+      return acc;
+    }, {});
+
+    res.json({
+      ip,
+      location,
+      totalVisits: logs.length,
+      channels,
+      firstSeen,
+      lastSeen,
+      eventBreakdown,
+      recentLogs: logs.slice(0, 30)
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 // Admin: Delete all logs
 router.delete('/admin/logs', authenticate, async (req, res) => {
   try {
