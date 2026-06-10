@@ -547,13 +547,17 @@ router.get('/admin/stats', authenticate, async (req, res) => {
     const totalReactionsRaw = await Channel.aggregate([{ $group: { _id: null, total: { $sum: "$reactionsCount" } } }]);
     const totalReactions = totalReactionsRaw.length > 0 ? totalReactionsRaw[0].total : 0;
 
-    // Views by day for last 7 days
-    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+    // Views by day for last 7 days — grouped by BD midnight (Asia/Dhaka = UTC+6)
+    // Look back 8 UTC days to guarantee 7 complete BD days are always captured.
+    // (BD is UTC+6, so a BD day starts 6hrs before its UTC equivalent — 7 UTC days would cut off the first BD day)
+    const sevenDaysAgo = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000);
     const viewsByDayRaw = await Audit.aggregate([
       { $match: { type: 'PLAY_START', timestamp: { $gte: sevenDaysAgo } } },
       {
         $group: {
-          _id: { $dateToString: { format: "%Y-%m-%d", date: "$timestamp" } },
+          // ✅ FIX: timezone: "Asia/Dhaka" makes the day boundary midnight BD time (UTC+6)
+          // Without this, MongoDB uses UTC midnight = 6:00 AM BD — wrong day grouping!
+          _id: { $dateToString: { format: "%Y-%m-%d", date: "$timestamp", timezone: "Asia/Dhaka" } },
           views: { $sum: 1 }
         }
       },
