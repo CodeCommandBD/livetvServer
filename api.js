@@ -36,6 +36,12 @@ const authenticate = (req, res, next) => {
 router.post('/admin/login', async (req, res) => {
   try {
     const { username, password } = req.body;
+
+    // ✅ Fix Logic Error: Prevent bcrypt.compare crash if password is missing
+    if (!username || !password) {
+      return res.status(400).json({ error: 'Username and password are required' });
+    }
+
     const admin = await Admin.findOne({ username });
 
     if (!admin) return res.status(401).json({ error: 'Invalid credentials' });
@@ -158,7 +164,16 @@ router.post('/automation/check-links', authenticate, async (req, res) => {
 let matchClients = [];
 
 const notifyMatchUpdate = () => {
-  matchClients.forEach(client => client.write(`data: update\n\n`));
+  matchClients.forEach(client => {
+    try {
+      // ✅ Fix Logic Error: Prevent ERR_STREAM_WRITE_AFTER_END server crash
+      if (!client.writableEnded) {
+        client.write(`data: update\n\n`);
+      }
+    } catch (err) {
+      // Safely ignore write errors to disconnected clients
+    }
+  });
 };
 global.notifyMatchUpdate = notifyMatchUpdate;
 
@@ -175,7 +190,16 @@ router.get('/matches/stream', (req, res) => {
   // Send a keep-alive comment every 30 seconds to prevent reverse proxies (Render/Nginx)
   // from closing the connection due to idle timeout!
   const keepAliveId = setInterval(() => {
-    res.write(`:\n\n`); 
+    try {
+      // ✅ Prevent crash on ungraceful disconnect
+      if (!res.writableEnded) {
+        res.write(`:\n\n`); 
+      } else {
+        clearInterval(keepAliveId);
+      }
+    } catch (err) {
+      clearInterval(keepAliveId);
+    }
   }, 30000);
 
   req.on('close', () => {
@@ -242,7 +266,7 @@ router.get('/home-sections', async (req, res) => {
       if (cachedSections) return res.json(cachedSections);
     }
     const setting = await Setting.findOne({ key: 'homeSections' });
-    const defaultSections = { cricket: [], football: [], watchRecommended: [] };
+    const defaultSections = { cricket: [], football: [], watchRecommended: [], watchFootball: [], watchCricket: [] };
     const sections = setting ? { ...defaultSections, ...setting.value } : defaultSections;
     if (redis) {
       await redis.set('nexplaytv:homeSections', sections, { ex: 3600 }); // Cache for 1 hour
