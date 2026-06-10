@@ -630,6 +630,68 @@ router.get('/admin/ip-details/:ip', authenticate, async (req, res) => {
   }
 });
 
+// Admin: Get all unique visitors aggregated from audit logs
+router.get('/admin/visitors', authenticate, async (req, res) => {
+  try {
+    const visitors = await Audit.aggregate([
+      // Only include logs that have an IP address
+      { $match: { 'metadata.ip': { $exists: true, $ne: null } } },
+      
+      // Group by IP address
+      {
+        $group: {
+          _id: '$metadata.ip',
+          totalVisits: { $sum: 1 },
+          firstSeen: { $min: '$timestamp' },
+          lastSeen: { $max: '$timestamp' },
+          // Collect all channels watched
+          channels: { $addToSet: '$channel' },
+          // Keep the last known location (using $last since we sort later, but in group we just grab first available)
+          locations: { $addToSet: '$metadata.location' }
+        }
+      },
+      
+      // Project the final structure
+      {
+        $project: {
+          ip: '$_id',
+          totalVisits: 1,
+          firstSeen: 1,
+          lastSeen: 1,
+          channels: {
+            // Filter out null/empty channels and count unique
+            $size: {
+              $filter: {
+                input: '$channels',
+                as: 'ch',
+                cond: { $and: [{ $ne: ['$$ch', null] }, { $ne: ['$$ch', 'SYSTEM_BOT'] }] }
+              }
+            }
+          },
+          location: { 
+            $arrayElemAt: [{ 
+              $filter: { 
+                input: '$locations', 
+                as: 'loc', 
+                cond: { $ne: ['$$loc', null] } 
+              } 
+            }, 0] 
+          },
+          _id: 0
+        }
+      },
+      
+      // Sort by most recently seen
+      { $sort: { lastSeen: -1 } }
+    ]);
+
+    res.json(visitors);
+  } catch (err) {
+    console.error("Visitor Aggregation Error:", err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 // Admin: Delete all logs
 router.delete('/admin/logs', authenticate, async (req, res) => {
   try {
