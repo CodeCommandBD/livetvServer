@@ -9,6 +9,7 @@ const Audit = require('./models/Audit');
 const Match = require('./models/Match');
 const Setting = require('./models/Setting');
 const Contact = require('./models/Contact');
+const SyncSource = require('./models/SyncSource');
 const { syncFromGitHub, checkLinks } = require('./cron');
 const redis = require('./config/redis');
 
@@ -152,6 +153,68 @@ router.post('/automation/check-links', authenticate, async (req, res) => {
     });
 
     res.json({ success: true, message: 'Check started' });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ========================
+// SYNC SOURCES CRUD
+// ========================
+
+// GET all sync sources
+router.get('/sync-sources', authenticate, async (req, res) => {
+  try {
+    const sources = await SyncSource.find({}).sort({ createdAt: -1 });
+    res.json(sources);
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// POST — add a new sync source
+router.post('/sync-sources', authenticate, async (req, res) => {
+  try {
+    const { name, url, type } = req.body;
+    if (!name || !url || !type) {
+      return res.status(400).json({ error: 'name, url, and type are required.' });
+    }
+    if (!['json', 'm3u'].includes(type)) {
+      return res.status(400).json({ error: 'type must be "json" or "m3u".' });
+    }
+    const source = new SyncSource({ name: name.trim(), url: url.trim(), type });
+    await source.save();
+    res.status(201).json(source);
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// PUT — toggle enabled/disabled
+router.put('/sync-sources/:id', authenticate, async (req, res) => {
+  try {
+    const { enabled } = req.body;
+    if (typeof enabled !== 'boolean') {
+      return res.status(400).json({ error: '"enabled" must be a boolean.' });
+    }
+    const source = await SyncSource.findByIdAndUpdate(
+      req.params.id,
+      { enabled },
+      { new: true }
+    );
+    if (!source) return res.status(404).json({ error: 'Source not found.' });
+    res.json(source);
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// DELETE — remove a sync source
+router.delete('/sync-sources/:id', authenticate, async (req, res) => {
+  try {
+    const source = await SyncSource.findByIdAndDelete(req.params.id);
+    if (!source) return res.status(404).json({ error: 'Source not found.' });
+    res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
   }

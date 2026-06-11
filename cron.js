@@ -4,39 +4,46 @@ const axios = require('axios');
 const Channel = require('./models/Channel');
 const Audit = require('./models/Audit');
 const Match = require('./models/Match');
+const SyncSource = require('./models/SyncSource');
 const redis = require('./config/redis');
 
-const SYNC_URLS = [
-  'https://raw.githubusercontent.com/SHAJON-404/iptv/refs/heads/main/app/data/channels.json',
-  'https://iptv-org.github.io/iptv/categories/sports.m3u'
-];
+// Regex to detect any valid streaming URL protocol
+// Fixes RTMP/RTSP skip bug where only 'http' was checked before
+const STREAM_URL_REGEX = /^(https?|rtmp|rtmps|rtsp|udp):///i;
 
 // ==========================================
-// 1. AUTO GITHUB SYNC (Runs Daily at 00:00)
+// 1. AUTO SYNC (reads sources from DB)
 // ==========================================
 const syncFromGitHub = async () => {
-  console.log('[Cron] Starting GitHub Sync...');
+  console.log('[Cron] Starting Dynamic Sync...');
   try {
+    // Load only enabled sources from the database (Dynamic!)
+    const sources = await SyncSource.find({ enabled: true });
+
+    if (sources.length === 0) {
+      console.log('[Cron] No enabled sync sources found. Skipping.');
+      return { addedCount: 0, updatedCount: 0 };
+    }
+
     let allNewChannels = [];
 
-    for (const url of SYNC_URLS) {
+    for (const source of sources) {
       try {
-        console.log(`[Cron] Fetching ${url}...`);
-        const res = await axios.get(url, { timeout: 15000 });
+        console.log(`[Cron] Fetching "${source.name}" → ${source.url}`);
+        const res = await axios.get(source.url, { timeout: 20000 });
         let parsedChannels = [];
 
-        if (url.endsWith('.m3u') || url.endsWith('.m3u8')) {
-          // Parse M3U
-          // ✅ Bug Fix: Ensure data is a string before calling .split().
-          // Axios may return a Buffer or Object if content-type is mismatched.
+        if (source.type === 'm3u') {
+          // ✅ Ensure data is always a string — Axios may return Buffer/Object on content-type mismatch
           const rawData = typeof res.data === 'string' ? res.data : res.data.toString();
           const lines = rawData.split('\n');
           let currentChannel = {};
+
           for (let line of lines) {
             line = line.trim();
+
             if (line.startsWith('#EXTINF:')) {
-              // ✅ Bug Fix 1: Use indexOf(',') not split(',').pop()
-              // Handles channel names that contain commas e.g. "Sports, HD"
+              // ✅ Use indexOf(',') not split — channel names can contain commas e.g. "Sports, HD"
               const commaIdx = line.indexOf(',');
               const metaPart = commaIdx !== -1 ? line.substring(0, commaIdx) : line;
               const namePart = commaIdx !== -1 ? line.substring(commaIdx + 1).trim() : '';
@@ -44,96 +51,108 @@ const syncFromGitHub = async () => {
               const logoMatch = metaPart.match(/tvg-logo="([^"]+)"/i);
               const groupMatch = metaPart.match(/group-title="([^"]+)"/i);
 
-              // ✅ Bug Fix 3: Guard against empty string names (not just null/undefined)
+              // ✅ Guard against empty string names
               const name = namePart.length > 0 ? namePart : 'Unknown Channel';
+              currentChannel = {
+                name,
+                logo: logoMatch ? logoMatch[1] : '',
+                group: groupMatch ? groupMatch[1] : 'Uncategorized'
+              };
 
-              // ✅ Bug Fix 4: If a previous #EXTINF had no URL yet, silently discard it
-              // (don't push orphaned channel objects with no stream link)
-              currentChannel = { name, logo: logoMatch ? logoMatch[1] : '', group: groupMatch ? groupMatch[1] : 'Uncategorized' };
-            } else if (line.startsWith('http')) {
+            } else if (STREAM_URL_REGEX.test(line)) {
+              // ✅ RTMP BUG FIX: Accept rtmp://, rtsp://, http://, https://, udp:// — not just http
               if (currentChannel.name) {
-                // ✅ Bug Fix 5: line is already .trim()'d — strips trailing \r from Windows CRLF files
-                currentChannel.url = line;
-                parsedChannels.push(currentChannel);
-                currentChannel = {}; // Reset
+                currentChannel.url = line; // line is already trimmed, strips \r
+                parsedChannels.push({ ...currentChannel });
+                currentChannel = {}; // Reset for next channel
               }
             }
           }
         } else {
-          // Parse JSON
-          parsedChannels = res.data;
-          if (!Array.isArray(parsedChannels)) {
-            throw new Error("Invalid JSON format from GitHub. Expected an array.");
+          // JSON source
+          parsedChannels = Array.isArray(res.data) ? res.data : [];
+          if (parsedChannels.length === 0) {
+            throw new Error('Invalid JSON: expected a non-empty array.');
           }
         }
+
+        console.log(`[Cron] Parsed ${parsedChannels.length} channels from "${source.name}"`);
         allNewChannels = allNewChannels.concat(parsedChannels);
+
+        // Update per-source metadata so admin can see last sync time & count
+        await SyncSource.findByIdAndUpdate(source._id, {
+          lastSyncedAt: new Date(),
+          lastChannelCount: parsedChannels.length,
+          lastError: null
+        });
+
       } catch (err) {
-        console.error(`[Cron] Failed to fetch or parse ${url}:`, err.message);
+        console.error(`[Cron] Failed to fetch/parse "${source.name}": ${err.message}`);
+        // Record error on the source so admin can see it in the UI
+        await SyncSource.findByIdAndUpdate(source._id, {
+          lastSyncedAt: new Date(),
+          lastError: err.message
+        });
       }
     }
 
     if (allNewChannels.length === 0) {
-      throw new Error("No channels found from any source.");
+      throw new Error('No channels parsed from any enabled source.');
     }
 
-    // ✅ Bug Fix 2: Deduplicate by channel name BEFORE hitting the database.
-    // Without this, a channel present in BOTH the JSON source and M3U source
-    // would be inserted TWICE. JSON source (index 0 in SYNC_URLS) takes priority.
+    // ✅ Deduplicate by name BEFORE hitting DB — first-seen (higher priority source) wins
     const dedupedMap = new Map();
     for (const ch of allNewChannels) {
       if (ch.name && ch.url && !dedupedMap.has(ch.name)) {
-        dedupedMap.set(ch.name, ch); // first-seen wins (JSON has higher priority)
+        dedupedMap.set(ch.name, ch);
       }
     }
     const dedupedChannels = Array.from(dedupedMap.values());
-    console.log(`[Cron] ${allNewChannels.length} total → ${dedupedChannels.length} unique channels after dedup.`);
+    console.log(`[Cron] ${allNewChannels.length} total → ${dedupedChannels.length} unique after dedup.`);
 
+    // Load all existing DB channels into a Map for O(1) lookup
     const existingChannels = await Channel.find({});
     const channelMap = new Map();
-    for (const c of existingChannels) {
-      channelMap.set(c.name, c);
-    }
+    for (const c of existingChannels) channelMap.set(c.name, c);
 
     let updatedCount = 0;
     let addedCount = 0;
     const bulkOps = [];
 
-    for (const ghChannel of dedupedChannels) {
-      if (!ghChannel.url) continue;
+    for (const incoming of dedupedChannels) {
+      if (!incoming.url) continue;
 
-      const existingChannel = channelMap.get(ghChannel.name);
-      
-      if (existingChannel) {
-        // Sync any changes from GitHub (URL, Logo, Group) to the database
-        if (
-          existingChannel.url !== ghChannel.url ||
-          // ✅ Bug Fix 3: Only compare logos if the incoming logo is non-empty.
-          // Without this guard, a channel from M3U (which has logo='') would
-          // overwrite a valid logo already stored in the DB every single sync.
-          (ghChannel.logo && existingChannel.logo !== ghChannel.logo) ||
-          (ghChannel.group && existingChannel.group !== ghChannel.group)
-        ) {
+      const existing = channelMap.get(incoming.name);
+
+      if (existing) {
+        // Only update if something actually changed (avoid unnecessary DB writes)
+        const urlChanged = existing.url !== incoming.url;
+        const logoChanged = incoming.logo && existing.logo !== incoming.logo;
+        const groupChanged = incoming.group && existing.group !== incoming.group;
+
+        if (urlChanged || logoChanged || groupChanged) {
           bulkOps.push({
             updateOne: {
-              filter: { _id: existingChannel._id },
-              update: { 
-                $set: { 
-                  url: ghChannel.url,
-                  logo: ghChannel.logo || existingChannel.logo,
-                  group: ghChannel.group || existingChannel.group,
-                  // If URL changed, assume it might be live again and reset dead status
-                  status: existingChannel.url !== ghChannel.url && existingChannel.status === 'dead' ? 'live' : existingChannel.status
-                } 
+              filter: { _id: existing._id },
+              update: {
+                $set: {
+                  url: incoming.url,
+                  // ✅ Never overwrite a valid logo with an empty string
+                  logo: incoming.logo || existing.logo,
+                  group: incoming.group || existing.group,
+                  // If URL changed and was dead, give it a second chance
+                  status: urlChanged && existing.status === 'dead' ? 'live' : existing.status
+                }
               }
             }
           });
           updatedCount++;
         }
       } else {
-        // New channel found in GitHub!
+        // Brand new channel — insert it
         bulkOps.push({
           insertOne: {
-            document: { ...ghChannel, addedViaSync: true }
+            document: { ...incoming, addedViaSync: true }
           }
         });
         addedCount++;
@@ -142,32 +161,31 @@ const syncFromGitHub = async () => {
 
     if (bulkOps.length > 0) {
       try {
-        // ordered: false — continue processing remaining ops even if one fails,
-        // instead of aborting the entire batch on first error (default ordered:true behaviour).
+        // ordered: false — don't abort on first error, process all ops
         await Channel.bulkWrite(bulkOps, { ordered: false });
       } catch (bulkErr) {
-        // BulkWriteError: some ops may have succeeded, some failed.
-        // Log but don't throw — partial sync is better than total failure.
         console.error('[Cron] BulkWrite partial failure:', bulkErr.message);
-        await new Audit({ type: 'AUTO_SYNC', channel: 'SYSTEM_BOT', metadata: { message: `Partial BulkWrite error: ${bulkErr.message}`, status: 'warning' } }).save().catch(() => {});
       }
+
+      // Clear Redis channel cache so users get fresh data immediately
       if (redis) {
         try {
           await redis.del('nexplaytv:channels');
           console.log('[Cron] Cleared Redis cache after sync.');
         } catch (e) {
-          console.error('[Cron] Failed to clear Redis cache:', e.message);
+          console.error('[Cron] Redis clear failed:', e.message);
         }
       }
     }
 
-    const message = `Added ${addedCount} new channels, updated ${updatedCount} expired tokens.`;
+    const message = `Added ${addedCount} new, updated ${updatedCount} channels from ${sources.length} source(s).`;
     await new Audit({ type: 'AUTO_SYNC', channel: 'SYSTEM_BOT', metadata: { message, status: 'success' } }).save();
-    console.log(`[Cron] Sync Complete: ${addedCount} added, ${updatedCount} updated.`);
+    console.log(`[Cron] Sync Complete: ${message}`);
     return { addedCount, updatedCount };
+
   } catch (err) {
-    await new Audit({ type: 'AUTO_SYNC', channel: 'SYSTEM_BOT', metadata: { message: err.message, status: 'error' } }).save().catch(()=>{});
-    console.error('[Cron] GitHub Sync Failed:', err.message);
+    await new Audit({ type: 'AUTO_SYNC', channel: 'SYSTEM_BOT', metadata: { message: err.message, status: 'error' } }).save().catch(() => {});
+    console.error('[Cron] Sync Failed:', err.message);
   }
 };
 
