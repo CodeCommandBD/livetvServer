@@ -8,7 +8,7 @@ const redis = require('./config/redis');
 
 const SYNC_URLS = [
   'https://raw.githubusercontent.com/SHAJON-404/iptv/refs/heads/main/app/data/channels.json',
-  'https://raw.githubusercontent.com/Free-TV/IPTV/master/playlist.m3u8'
+  'https://iptv-org.github.io/iptv/categories/sports.m3u'
 ];
 
 // ==========================================
