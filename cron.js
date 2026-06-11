@@ -215,10 +215,14 @@ const autoEndMatches = async () => {
       const durationMs = now - match.startTime;
       const durationHours = durationMs / (1000 * 60 * 60);
 
+      // Skip auto-end for CRICKET matches (handled manually by admin)
+      if (match.sport === 'CRICKET') {
+        continue;
+      }
+
       // Define max safe duration based on sport
       let maxHours = 4; // Default 4 hours
       if (match.sport === 'FOOTBALL') maxHours = 3; // 3 hours max for football
-      if (match.sport === 'CRICKET') maxHours = 8; // 8 hours max to cover ODIs
 
       if (durationHours >= maxHours) {
         bulkOps.push({
