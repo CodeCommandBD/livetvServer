@@ -6,7 +6,10 @@ const Audit = require('./models/Audit');
 const Match = require('./models/Match');
 const redis = require('./config/redis');
 
-const GITHUB_URL = 'https://raw.githubusercontent.com/SHAJON-404/iptv/refs/heads/main/app/data/channels.json';
+const SYNC_URLS = [
+  'https://raw.githubusercontent.com/SHAJON-404/iptv/refs/heads/main/app/data/channels.json',
+  'https://raw.githubusercontent.com/Free-TV/IPTV/master/playlist.m3u8'
+];
 
 // ==========================================
 // 1. AUTO GITHUB SYNC (Runs Daily at 00:00)
@@ -14,11 +17,76 @@ const GITHUB_URL = 'https://raw.githubusercontent.com/SHAJON-404/iptv/refs/heads
 const syncFromGitHub = async () => {
   console.log('[Cron] Starting GitHub Sync...');
   try {
-    const res = await axios.get(GITHUB_URL);
-    const newChannels = res.data;
-    if (!Array.isArray(newChannels)) {
-      throw new Error("Invalid JSON format from GitHub. Expected an array.");
+    let allNewChannels = [];
+
+    for (const url of SYNC_URLS) {
+      try {
+        console.log(`[Cron] Fetching ${url}...`);
+        const res = await axios.get(url, { timeout: 15000 });
+        let parsedChannels = [];
+
+        if (url.endsWith('.m3u') || url.endsWith('.m3u8')) {
+          // Parse M3U
+          // ✅ Bug Fix: Ensure data is a string before calling .split().
+          // Axios may return a Buffer or Object if content-type is mismatched.
+          const rawData = typeof res.data === 'string' ? res.data : res.data.toString();
+          const lines = rawData.split('\n');
+          let currentChannel = {};
+          for (let line of lines) {
+            line = line.trim();
+            if (line.startsWith('#EXTINF:')) {
+              // ✅ Bug Fix 1: Use indexOf(',') not split(',').pop()
+              // Handles channel names that contain commas e.g. "Sports, HD"
+              const commaIdx = line.indexOf(',');
+              const metaPart = commaIdx !== -1 ? line.substring(0, commaIdx) : line;
+              const namePart = commaIdx !== -1 ? line.substring(commaIdx + 1).trim() : '';
+
+              const logoMatch = metaPart.match(/tvg-logo="([^"]+)"/i);
+              const groupMatch = metaPart.match(/group-title="([^"]+)"/i);
+
+              // ✅ Bug Fix 3: Guard against empty string names (not just null/undefined)
+              const name = namePart.length > 0 ? namePart : 'Unknown Channel';
+
+              // ✅ Bug Fix 4: If a previous #EXTINF had no URL yet, silently discard it
+              // (don't push orphaned channel objects with no stream link)
+              currentChannel = { name, logo: logoMatch ? logoMatch[1] : '', group: groupMatch ? groupMatch[1] : 'Uncategorized' };
+            } else if (line.startsWith('http')) {
+              if (currentChannel.name) {
+                // ✅ Bug Fix 5: line is already .trim()'d — strips trailing \r from Windows CRLF files
+                currentChannel.url = line;
+                parsedChannels.push(currentChannel);
+                currentChannel = {}; // Reset
+              }
+            }
+          }
+        } else {
+          // Parse JSON
+          parsedChannels = res.data;
+          if (!Array.isArray(parsedChannels)) {
+            throw new Error("Invalid JSON format from GitHub. Expected an array.");
+          }
+        }
+        allNewChannels = allNewChannels.concat(parsedChannels);
+      } catch (err) {
+        console.error(`[Cron] Failed to fetch or parse ${url}:`, err.message);
+      }
     }
+
+    if (allNewChannels.length === 0) {
+      throw new Error("No channels found from any source.");
+    }
+
+    // ✅ Bug Fix 2: Deduplicate by channel name BEFORE hitting the database.
+    // Without this, a channel present in BOTH the JSON source and M3U source
+    // would be inserted TWICE. JSON source (index 0 in SYNC_URLS) takes priority.
+    const dedupedMap = new Map();
+    for (const ch of allNewChannels) {
+      if (ch.name && ch.url && !dedupedMap.has(ch.name)) {
+        dedupedMap.set(ch.name, ch); // first-seen wins (JSON has higher priority)
+      }
+    }
+    const dedupedChannels = Array.from(dedupedMap.values());
+    console.log(`[Cron] ${allNewChannels.length} total → ${dedupedChannels.length} unique channels after dedup.`);
 
     const existingChannels = await Channel.find({});
     const channelMap = new Map();
@@ -30,7 +98,7 @@ const syncFromGitHub = async () => {
     let addedCount = 0;
     const bulkOps = [];
 
-    for (const ghChannel of newChannels) {
+    for (const ghChannel of dedupedChannels) {
       if (!ghChannel.url) continue;
 
       const existingChannel = channelMap.get(ghChannel.name);
@@ -39,8 +107,11 @@ const syncFromGitHub = async () => {
         // Sync any changes from GitHub (URL, Logo, Group) to the database
         if (
           existingChannel.url !== ghChannel.url ||
-          existingChannel.logo !== ghChannel.logo ||
-          existingChannel.group !== ghChannel.group
+          // ✅ Bug Fix 3: Only compare logos if the incoming logo is non-empty.
+          // Without this guard, a channel from M3U (which has logo='') would
+          // overwrite a valid logo already stored in the DB every single sync.
+          (ghChannel.logo && existingChannel.logo !== ghChannel.logo) ||
+          (ghChannel.group && existingChannel.group !== ghChannel.group)
         ) {
           bulkOps.push({
             updateOne: {
@@ -70,7 +141,16 @@ const syncFromGitHub = async () => {
     }
 
     if (bulkOps.length > 0) {
-      await Channel.bulkWrite(bulkOps);
+      try {
+        // ordered: false — continue processing remaining ops even if one fails,
+        // instead of aborting the entire batch on first error (default ordered:true behaviour).
+        await Channel.bulkWrite(bulkOps, { ordered: false });
+      } catch (bulkErr) {
+        // BulkWriteError: some ops may have succeeded, some failed.
+        // Log but don't throw — partial sync is better than total failure.
+        console.error('[Cron] BulkWrite partial failure:', bulkErr.message);
+        await new Audit({ type: 'AUTO_SYNC', channel: 'SYSTEM_BOT', metadata: { message: `Partial BulkWrite error: ${bulkErr.message}`, status: 'warning' } }).save().catch(() => {});
+      }
       if (redis) {
         try {
           await redis.del('nexplaytv:channels');
@@ -113,8 +193,7 @@ const checkLinks = async () => {
       try {
         if (!channel.url || !channel.url.startsWith('http')) {
           await Channel.findByIdAndUpdate(channel._id, { status: 'dead' });
-          deadCount++;
-          return;
+          return 'dead'; // ✅ Bug Fix 1: Return result instead of mutating shared counter
         }
         
         const startPing = Date.now();
@@ -127,20 +206,27 @@ const checkLinks = async () => {
         });
         
         if (response.data && typeof response.data.destroy === 'function') {
+          // ✅ Bug Fix 2: Attach error listener BEFORE destroy() to prevent
+          // unhandled 'error' event crash if the stream emits an error after destroy
+          response.data.on('error', () => {}); // silently ignore post-destroy errors
           response.data.destroy();
         }
         
         const latency = Date.now() - startPing;
         await Channel.findByIdAndUpdate(channel._id, { status: 'live', ping: latency });
+        return 'live';
       } catch (err) {
         if (err.response && (err.response.status === 404 || err.response.status === 403 || err.response.status === 410)) {
           await Channel.findByIdAndUpdate(channel._id, { status: 'dead' });
-          deadCount++;
+          return 'dead'; // ✅ Bug Fix 1: Return result instead of mutating shared counter
         }
+        return 'unknown'; // Network timeout, ECONNRESET etc. — don't mark as dead
       }
     });
 
-    await Promise.all(checks);
+    const results = await Promise.all(checks);
+    // ✅ Bug Fix 1: Count dead channels from returned results — safe, no race condition
+    deadCount = results.filter(r => r === 'dead').length;
 
     // CRITICAL: Clear Redis Cache so frontend users instantly see the Dead/Live status and Ping updates!
     if (redis) {
@@ -212,6 +298,14 @@ const autoEndMatches = async () => {
     let endedCount = 0;
 
     for (const match of liveMatches) {
+      // ✅ Bug Fix: Guard against null/invalid startTime.
+      // If startTime is missing, durationMs = NaN, and NaN >= maxHours = false,
+      // causing the match to stay LIVE forever and never auto-end.
+      if (!match.startTime || isNaN(new Date(match.startTime).getTime())) {
+        console.warn(`[Cron] Match ${match._id} has invalid startTime, skipping auto-end.`);
+        continue;
+      }
+
       const durationMs = now - match.startTime;
       const durationHours = durationMs / (1000 * 60 * 60);
 
