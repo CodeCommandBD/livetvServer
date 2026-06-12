@@ -331,7 +331,12 @@ const autoStartMatches = async () => {
       const bulkOps = matchesToStart.map(match => ({
         updateOne: {
           filter: { _id: match._id },
-          update: { $set: { status: 'LIVE' } }
+          update: { 
+            $set: { 
+              status: 'LIVE',
+              liveStartedAt: now // FIX: Set liveStartedAt so frontend timer starts counting!
+            } 
+          }
         }
       }));
 
