@@ -166,6 +166,8 @@ const syncFromGitHub = async () => {
       const existing = channelMap.get(incoming.name);
 
       if (existing) {
+        if (existing.status === 'banned') continue; // Do not update or resurrect banned channels
+        
         // Only update if something actually changed (avoid unnecessary DB writes)
         const urlChanged = existing.url !== incoming.url;
         const logoChanged = incoming.logo && existing.logo !== incoming.logo;
@@ -242,6 +244,7 @@ const checkLinks = async () => {
     // ✅ Bug Fix 3: Removed { status: { $ne: 'dead' } }
     // Dead channels must be checked periodically to see if the server came back online!
     const batch = await Channel.aggregate([
+      { $match: { status: { $ne: 'banned' } } },
       { $sample: { size: 50 } }
     ]);
 

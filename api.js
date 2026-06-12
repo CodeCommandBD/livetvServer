@@ -504,7 +504,7 @@ router.get('/channels', async (req, res) => {
       }
     }
     
-    const channels = await Channel.find().select('-__v');
+    const channels = await Channel.find({ status: { $ne: 'banned' } }).select('-__v');
     
     if (redis) {
       try {
@@ -618,7 +618,11 @@ router.delete('/channels/:id', authenticate, async (req, res) => {
     
     if (!oldChannel) return res.status(404).json({ error: 'Channel not found' });
     
-    await Channel.findByIdAndDelete(oldChannel._id);
+    // CRITICAL LOGICAL FIX: "Zombie Channel" Resurrection Bug
+    // If we physically delete a channel that came from an Auto-Sync M3U list, 
+    // the next sync will just re-insert it because it doesn't see it in the DB!
+    // Instead of deleting, we "soft delete" it as 'banned' so the sync script knows to ignore it.
+    await Channel.findByIdAndUpdate(oldChannel._id, { status: 'banned' });
     
     // CRITICAL LOGICAL FIX: Dangling Match Reference Cleanup
     // If a channel is deleted, remove all active matches attached to it to prevent frontend crashes
@@ -626,7 +630,7 @@ router.delete('/channels/:id', authenticate, async (req, res) => {
     if (global.notifyMatchUpdate) global.notifyMatchUpdate();
 
     invalidateCache();
-    res.json({ message: 'Channel deleted' });
+    res.json({ message: 'Channel deleted (soft-banned to prevent sync resurrection)' });
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
   }
