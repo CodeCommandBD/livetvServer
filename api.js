@@ -379,10 +379,30 @@ router.post('/admin/matches', authenticate, async (req, res) => {
 
 router.put('/admin/matches/:id', authenticate, async (req, res) => {
   try {
-    // CRITICAL SECURITY FIX: Mongoose Schema Validation Bypass Protection
-    // Enforce runValidators: true so that updates do not bypass schema rules (e.g. required fields, enums).
-    const match = await Match.findByIdAndUpdate(req.params.id, req.body, { new: true, runValidators: true });
-    if (!match) return res.status(404).json({ error: 'Match not found' });
+    // AUTO-SET liveStartedAt: When admin changes status to LIVE for the first time,
+    // record the exact timestamp so the frontend can show an accurate elapsed timer.
+    const existingMatch = await Match.findById(req.params.id);
+    if (!existingMatch) return res.status(404).json({ error: 'Match not found' });
+
+    const updateData = { ...req.body };
+
+    // If transitioning to LIVE and liveStartedAt not already set, auto-set it now
+    if (updateData.status === 'LIVE' && !existingMatch.liveStartedAt) {
+      updateData.liveStartedAt = new Date();
+    }
+    // If transitioning away from LIVE (e.g., ENDED), keep liveStartedAt for history
+
+    // CRITICAL LOGICAL FIX: Use $set for partial updates.
+    // Previously `updateData` was passed directly, so `runValidators: true` would
+    // validate ALL schema fields \u2014 including required ones NOT present in a partial
+    // update (e.g. a score-only update). This caused a Mongoose ValidationError crash
+    // every time the admin clicked the \u26bd goal +/- button on the frontend.
+    // Wrapping in $set tells Mongoose to only validate the fields being changed.
+    const match = await Match.findByIdAndUpdate(
+      req.params.id,
+      { $set: updateData },
+      { new: true, runValidators: true }
+    );
     notifyMatchUpdate();
     res.json(match);
   } catch (err) {
@@ -390,6 +410,7 @@ router.put('/admin/matches/:id', authenticate, async (req, res) => {
     res.status(500).json({ error: err.message || 'Server error' });
   }
 });
+
 
 router.delete('/admin/matches/:id', authenticate, async (req, res) => {
   try {
