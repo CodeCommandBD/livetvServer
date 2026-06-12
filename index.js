@@ -277,6 +277,12 @@ app.get('/ping', (req, res) => {
   res.json({ status: 'ok', time: new Date().toISOString() });
 });
 
+// LOGICAL FIX: Proxy Deduplication & Caching
+// Prevents upstream IPTV servers from banning our IP when multiple users
+// watch the same channel. We cache playlists (.m3u8) for 2s and chunks (.ts) for 15s.
+const proxyCache = new Map(); // url -> { data: Buffer|String, expires: number, contentType: string }
+const proxyInFlight = new Map(); // url -> Promise<{ data, contentType }>
+
 app.get('/proxy', async (req, res) => {
   const targetUrl = req.query.url;
   const token = req.query.ptoken; // Proxy token
@@ -308,116 +314,161 @@ app.get('/proxy', async (req, res) => {
     const parsedUrl = new URL(targetUrl);
     const hostname = parsedUrl.hostname;
 
-    // CRITICAL SECURITY FIX: Server-Side Request Forgery (SSRF) Protection
-    // Block attackers from using the proxy to scan internal network ports, 
-    // access local services, or steal cloud metadata (like AWS IAM keys at 169.254.169.254)
     if (
-      hostname === 'localhost' ||
-      hostname === '127.0.0.1' ||
-      hostname === '::1' ||
-      hostname === '0.0.0.0' ||
-      hostname === '::' ||
-      hostname.startsWith('192.168.') ||
-      hostname.startsWith('10.') ||
-      hostname.startsWith('169.254.') ||
-      hostname.match(/^172\.(1[6-9]|2[0-9]|3[0-1])\./)
+      hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1' ||
+      hostname === '0.0.0.0' || hostname === '::' || hostname.startsWith('192.168.') ||
+      hostname.startsWith('10.') || hostname.startsWith('169.254.') || hostname.match(/^172\.(1[6-9]|2[0-9]|3[0-1])\./)
     ) {
-      return res.status(403).send('Forbidden: Internal IP addresses are blocked (SSRF Protection).');
+      return res.status(403).send('Forbidden: Internal IPs blocked.');
     }
 
-    // ALWAYS use stream to prevent massive RAM spikes.
-    // We will dynamically check Content-Type headers after connecting to decide 
-    // whether to parse it as a playlist or pipe it directly as a video segment.
-    const response = await axios({
-      url: targetUrl,
-      method: 'GET',
-      responseType: 'stream',
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        'Accept': '*/*',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Connection': 'keep-alive',
-      },
-      timeout: 12000,
-    });
+    const isPlaylistUrl = targetUrl.includes('.m3u8') || targetUrl.includes('mpegurl');
+    const isChunkUrl = targetUrl.includes('.ts') || targetUrl.includes('.m4s') || targetUrl.includes('.vtt');
 
-    const contentType = response.headers['content-type'] || '';
-    res.set('Content-Type', contentType);
-    res.set('Access-Control-Allow-Origin', '*');
-    res.set('Cache-Control', 'no-cache');
+    // 1. Check Cache
+    if (proxyCache.has(targetUrl)) {
+      const cached = proxyCache.get(targetUrl);
+      if (Date.now() < cached.expires) {
+        res.set('Content-Type', cached.contentType);
+        res.set('Access-Control-Allow-Origin', '*');
+        res.set('Cache-Control', 'public, max-age=2'); // Help browser cache chunks too
+        return res.send(cached.data);
+      } else {
+        proxyCache.delete(targetUrl);
+      }
+    }
 
-    // CRITICAL FIX: Handle Load Balancer Redirects!
-    // If the IPTV provider redirects from http://a.com/live to http://b.com/live.m3u8
-    // we MUST use the final URL (http://b.com) to resolve relative chunks inside the playlist!
-    // Otherwise, the proxy will request chunks from the original domain and get 404s.
-    const finalUrl = response.request?.res?.responseUrl || targetUrl;
+    // 2. Check In-Flight Deduplication
+    // If another user is CURRENTLY downloading this exact file, wait for their promise!
+    if (proxyInFlight.has(targetUrl)) {
+      try {
+        const result = await proxyInFlight.get(targetUrl);
+        res.set('Content-Type', result.contentType);
+        res.set('Access-Control-Allow-Origin', '*');
+        res.set('Cache-Control', 'public, max-age=2');
+        return res.send(result.data);
+      } catch (err) {
+        // Fall through and try again if the in-flight failed
+      }
+    }
 
-    const isPlaylist =
-      contentType.includes('mpegurl') ||
-      contentType.includes('x-mpegURL') ||
-      finalUrl.includes('.m3u8');
+    // 3. We are the first! Start the fetch.
+    const fetchPromise = (async () => {
+      // If it's a known chunk (like .ts), we use 'arraybuffer' so we can cache it in RAM.
+      // If it's an unknown URL (could be an endless RTMP stream), we MUST use 'stream' to avoid OOM.
+      // Playlists can be stream or string, but we read them into string anyway.
+      const shouldBuffer = isChunkUrl; 
 
-    if (isPlaylist) {
-      // CRITICAL SECURITY FIX: Playlist Buffer Overflow Protection
-      // Prevent malicious servers from sending gigabytes of fake playlist data
-      // which would crash the Node.js V8 memory limit (Max String Size)
-      let text = '';
-      let totalSize = 0;
-      for await (const chunk of response.data) {
-        totalSize += chunk.length;
-        if (totalSize > 5 * 1024 * 1024) { // 5MB Limit for a text playlist
-          response.data.destroy();
-          console.error(`[Proxy] Playlist exceeded 5MB limit: ${targetUrl}`);
-          return res.status(413).send('Payload Too Large: Playlist exceeds size limit.');
+      const response = await axios({
+        url: targetUrl,
+        method: 'GET',
+        responseType: shouldBuffer ? 'arraybuffer' : 'stream',
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+          'Accept': '*/*',
+          'Accept-Language': 'en-US,en;q=0.9',
+          'Connection': 'keep-alive',
+        },
+        timeout: 12000,
+      });
+
+      const contentType = response.headers['content-type'] || '';
+      const finalUrl = response.request?.res?.responseUrl || targetUrl;
+      const isPlaylist = isPlaylistUrl || contentType.includes('mpegurl') || contentType.includes('x-mpegURL');
+
+      if (isPlaylist) {
+        let text = '';
+        if (shouldBuffer) {
+          text = response.data.toString('utf8');
+        } else {
+          let totalSize = 0;
+          for await (const chunk of response.data) {
+            totalSize += chunk.length;
+            if (totalSize > 5 * 1024 * 1024) {
+              response.data.destroy();
+              throw new Error('Playlist exceeded 5MB limit');
+            }
+            text += chunk.toString('utf8');
+          }
         }
-        text += chunk.toString('utf8');
+
+        const rewritten = text.split('\n').map(line => {
+          const trimmed = line.trim();
+          if (!trimmed) return '';
+          if (trimmed.startsWith('#')) {
+            return trimmed.replace(/URI="([^"]+)"/g, (_, uri) => {
+              const abs = toAbsoluteUrl(uri, finalUrl);
+              return `URI="/proxy?url=${encodeURIComponent(abs)}&ptoken=${token}"`;
+            });
+          }
+          if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
+            return `/proxy?url=${encodeURIComponent(trimmed)}&ptoken=${token}`;
+          }
+          if (!trimmed.startsWith('#')) {
+            const abs = toAbsoluteUrl(trimmed, finalUrl);
+            return `/proxy?url=${encodeURIComponent(abs)}&ptoken=${token}`;
+          }
+          return trimmed;
+        }).join('\n');
+
+        return { data: rewritten, contentType, isStream: false, isPlaylist: true };
       }
 
-      const rewritten = text.split('\n').map(line => {
-        const trimmed = line.trim();
-        if (!trimmed) return '';
+      if (shouldBuffer) {
+        return { data: response.data, contentType, isStream: false, isPlaylist: false };
+      }
 
-        if (trimmed.startsWith('#')) {
-          return trimmed.replace(/URI="([^"]+)"/g, (_, uri) => {
-            const abs = toAbsoluteUrl(uri, finalUrl);
-            return `URI="/proxy?url=${encodeURIComponent(abs)}&ptoken=${token}"`;
-          });
-        }
+      // It's an endless stream or unknown binary. We cannot cache it.
+      return { data: response.data, contentType, isStream: true, isPlaylist: false };
+    })();
 
-        if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
-          return `/proxy?url=${encodeURIComponent(trimmed)}&ptoken=${token}`;
-        }
-
-        if (!trimmed.startsWith('#')) {
-          const abs = toAbsoluteUrl(trimmed, finalUrl);
-          return `/proxy?url=${encodeURIComponent(abs)}&ptoken=${token}`;
-        }
-
-        return trimmed;
-      }).join('\n');
-
-      return res.send(rewritten);
+    // Store in-flight ONLY if we can cache it (Playlists and Chunks)
+    const canCache = isPlaylistUrl || isChunkUrl;
+    if (canCache) {
+      proxyInFlight.set(targetUrl, fetchPromise);
     }
 
-    // It's a video segment (or unknown binary). Pipe it directly to save RAM!
-    response.data.pipe(res);
+    let result;
+    try {
+      result = await fetchPromise;
+    } finally {
+      if (canCache) proxyInFlight.delete(targetUrl);
+    }
 
-      // CRITICAL FIX: Memory Leak Prevention
-      // If the client disconnects (closes the browser/player) while a video chunk is downloading,
-      // we MUST destroy the Axios stream. Otherwise, the proxy will keep downloading the rest of the 
-      // chunk from the IPTV server into oblivion, wasting massive bandwidth and RAM!
+    res.set('Content-Type', result.contentType);
+    res.set('Access-Control-Allow-Origin', '*');
+
+    // 4. Return Data & Populate Cache
+    if (result.isStream) {
+      // Endless stream. Pipe directly, no caching.
+      res.set('Cache-Control', 'no-cache');
+      result.data.pipe(res);
+      
       res.on('close', () => {
-        if (!res.writableEnded && response.data && typeof response.data.destroy === 'function') {
-          response.data.on('error', () => {}); // Prevent unhandled error crash
-          response.data.destroy();
+        if (!res.writableEnded && result.data && typeof result.data.destroy === 'function') {
+          result.data.on('error', () => {});
+          result.data.destroy();
         }
       });
       res.on('error', () => {
-        if (response.data && typeof response.data.destroy === 'function') {
-          response.data.on('error', () => {}); // Prevent unhandled error crash
-          response.data.destroy();
+        if (result.data && typeof result.data.destroy === 'function') {
+          result.data.on('error', () => {});
+          result.data.destroy();
         }
       });
+      return;
+    }
+
+    // For Playlists & Chunks, save to cache
+    const cacheTtl = result.isPlaylist ? 2000 : 15000; // 2s for m3u8, 15s for TS chunks
+    proxyCache.set(targetUrl, {
+      data: result.data,
+      contentType: result.contentType,
+      expires: Date.now() + cacheTtl
+    });
+
+    res.set('Cache-Control', 'public, max-age=2');
+    return res.send(result.data);
 
   } catch (err) {
     const status = err.response?.status || 502;

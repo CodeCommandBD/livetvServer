@@ -247,10 +247,27 @@ const checkLinks = async () => {
 
     let deadCount = 0;
 
+    // LOGICAL FIX: Active Channel Exclusion
+    // Do NOT ping channels that users are currently watching! If the cron pings an actively watched channel,
+    // the upstream IPTV server sees multiple concurrent connections from our IP and will often issue an IP ban
+    // or rate limit, causing the stream to crash/freeze for 1-2 minutes for all users.
+    const activeChannels = new Set();
+    if (global.activeSessions) {
+      for (const session of global.activeSessions.values()) {
+        if (session.channelName) activeChannels.add(session.channelName);
+      }
+    }
+
     // Process all 50 channels concurrently instead of sequentially!
     // This reduces check time from 6+ minutes down to max 8 seconds.
     const checks = batch.map(async (channel) => {
       try {
+        if (activeChannels.has(channel.name)) {
+          // Channel is currently being watched, so it's obviously alive! Skip the ping.
+          await Channel.findByIdAndUpdate(channel._id, { status: 'live' });
+          return 'live';
+        }
+
         if (!channel.url || !channel.url.startsWith('http')) {
           await Channel.findByIdAndUpdate(channel._id, { status: 'dead' });
           return 'dead'; // ✅ Bug Fix 1: Return result instead of mutating shared counter
@@ -413,6 +430,149 @@ const autoEndMatches = async () => {
 };
 
 // ==========================================
+// 5. AUTO SYNC LIVE SCORES FROM ESPN (Runs every 1 min)
+// ==========================================
+
+// ESPN API endpoints for all major sports & leagues
+const ESPN_SCORE_APIS = [
+  // International Football
+  'https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.friendly/scoreboard',
+  'https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.worldq/scoreboard',
+  'https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/scoreboard',
+  'https://site.api.espn.com/apis/site/v2/sports/soccer/uefa.euro/scoreboard',
+  'https://site.api.espn.com/apis/site/v2/sports/soccer/conmebol.america/scoreboard',
+  'https://site.api.espn.com/apis/site/v2/sports/soccer/afc.cupofnations/scoreboard',
+  // Club Football
+  'https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/scoreboard',
+  'https://site.api.espn.com/apis/site/v2/sports/soccer/esp.1/scoreboard',
+  'https://site.api.espn.com/apis/site/v2/sports/soccer/ita.1/scoreboard',
+  'https://site.api.espn.com/apis/site/v2/sports/soccer/ger.1/scoreboard',
+  'https://site.api.espn.com/apis/site/v2/sports/soccer/fra.1/scoreboard',
+  'https://site.api.espn.com/apis/site/v2/sports/soccer/uefa.champions/scoreboard',
+  'https://site.api.espn.com/apis/site/v2/sports/soccer/uefa.europa/scoreboard',
+  'https://site.api.espn.com/apis/site/v2/sports/soccer/ksa.1/scoreboard',
+  'https://site.api.espn.com/apis/site/v2/sports/soccer/usa.1/scoreboard',
+  // Cricket
+  'https://site.api.espn.com/apis/site/v2/sports/cricket/8039/scoreboard',
+  'https://site.api.espn.com/apis/site/v2/sports/cricket/8048/scoreboard',
+  'https://site.api.espn.com/apis/site/v2/sports/cricket/8046/scoreboard',
+  'https://site.api.espn.com/apis/site/v2/sports/cricket/8053/scoreboard',
+  'https://site.api.espn.com/apis/site/v2/sports/cricket/8060/scoreboard',
+  'https://site.api.espn.com/apis/site/v2/sports/cricket/8044/scoreboard',
+];
+
+/**
+ * Fuzzy name match — handles partial names, hyphens, abbreviations.
+ * e.g. "Bosnia" matches "Bosnia-Herzegovina" or "Bosnia & Herz."
+ */
+function fuzzyMatch(dbName, espnName) {
+  if (!dbName || !espnName) return false;
+  const normalize = (s) => s.toLowerCase()
+    .replace(/[-_&.,]/g, ' ')   // Replace special chars with space
+    .replace(/\s+/g, ' ')       // Collapse multiple spaces
+    .trim();
+  const a = normalize(dbName);
+  const b = normalize(espnName);
+  return a.includes(b) || b.includes(a);
+}
+
+const autoSyncEspnScores = async () => {
+  try {
+    // Only run if there are LIVE matches
+    const liveMatches = await Match.find({ status: 'LIVE' });
+    if (liveMatches.length === 0) return;
+
+    // Fetch all ESPN scoreboards in parallel
+    const responses = await Promise.allSettled(
+      ESPN_SCORE_APIS.map(url =>
+        axios.get(url, { timeout: 8000 }).then(r => r.data).catch(() => null)
+      )
+    );
+
+    // Flatten all ESPN events into one array
+    const espnEvents = [];
+    responses.forEach(result => {
+      if (result.status === 'fulfilled' && result.value?.events) {
+        result.value.events.forEach(event => {
+          try {
+            const comp = event.competitions?.[0];
+            if (!comp) return;
+            const stateType = event.status?.type?.state;
+            // Only pick in-progress matches from ESPN
+            if (stateType !== 'in') return;
+
+            const home = comp.competitors?.find(c => c.homeAway === 'home');
+            const away = comp.competitors?.find(c => c.homeAway === 'away');
+            if (!home || !away) return;
+
+            espnEvents.push({
+              homeName: home.team.shortDisplayName || home.team.displayName || home.team.name,
+              awayName: away.team.shortDisplayName || away.team.displayName || away.team.name,
+              homeScore: home.score ?? '0',
+              awayScore: away.score ?? '0',
+              detail: event.status?.type?.shortDetail || '',
+            });
+          } catch (e) {}
+        });
+      }
+    });
+
+    if (espnEvents.length === 0) return;
+
+    const bulkOps = [];
+
+    for (const match of liveMatches) {
+      const t1 = match.team1?.name || '';
+      const t2 = match.team2?.name || '';
+
+      let found = null;
+      let reversed = false;
+
+      for (const e of espnEvents) {
+        const t1Home = fuzzyMatch(t1, e.homeName) && fuzzyMatch(t2, e.awayName);
+        const t1Away = fuzzyMatch(t1, e.awayName) && fuzzyMatch(t2, e.homeName);
+
+        if (t1Home) { found = e; reversed = false; break; }
+        if (t1Away) { found = e; reversed = true; break; }
+      }
+
+      if (!found) continue; // No ESPN match found, skip
+
+      const newScore = {
+        team1: reversed ? found.awayScore : found.homeScore,
+        team2: reversed ? found.homeScore : found.awayScore,
+      };
+
+      // Only update if score actually changed — avoids unnecessary DB writes
+      if (
+        String(newScore.team1) === String(match.score?.team1) &&
+        String(newScore.team2) === String(match.score?.team2)
+      ) continue;
+
+      console.log(`[ESPN Sync] ${t1} ${newScore.team1}–${newScore.team2} ${t2}`);
+
+      bulkOps.push({
+        updateOne: {
+          filter: { _id: match._id },
+          update: { $set: { 'score.team1': newScore.team1, 'score.team2': newScore.team2 } }
+        }
+      });
+    }
+
+    if (bulkOps.length > 0) {
+      await Match.bulkWrite(bulkOps);
+      // Notify frontend clients via SSE so scores update in real-time
+      if (global.notifyMatchUpdate) global.notifyMatchUpdate();
+      console.log(`[ESPN Sync] Updated scores for ${bulkOps.length} match(es).`);
+    }
+
+  } catch (err) {
+    console.error('[Cron] ESPN Score Sync Failed:', err.message);
+  }
+};
+
+// ==========================================
+
 // INITIALIZE CRON JOBS
 // ==========================================
 const initCronJobs = () => {
@@ -427,6 +587,9 @@ const initCronJobs = () => {
   // Check and auto-start upcoming matches every 1 minute
   cron.schedule('* * * * *', autoStartMatches);
   
+  // Auto-sync live scores from ESPN every 1 minute
+  cron.schedule('* * * * *', autoSyncEspnScores);
+
   // Check and auto-end old live matches every 10 minutes
   cron.schedule('*/10 * * * *', autoEndMatches);
   
@@ -438,5 +601,6 @@ module.exports = {
   syncFromGitHub,
   checkLinks,
   autoStartMatches,
-  autoEndMatches
+  autoEndMatches,
+  autoSyncEspnScores
 };

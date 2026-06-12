@@ -367,7 +367,12 @@ router.post('/admin/matches', authenticate, async (req, res) => {
       return res.status(400).json({ error: 'Field too long.' });
     }
 
-    const match = new Match(req.body);
+    const matchData = { ...req.body };
+    if (matchData.status === 'LIVE' && !matchData.liveStartedAt) {
+      matchData.liveStartedAt = new Date();
+    }
+
+    const match = new Match(matchData);
     await match.save();
     notifyMatchUpdate();
     res.status(201).json(match);
