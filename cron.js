@@ -578,7 +578,11 @@ global.cricApiScoresCache = [];
 
 const fetchCricApiScores = async () => {
   try {
-    const API_KEY = 'ffe300c5-39f9-4ed1-a8ce-b1c47c7c5faf';
+    const API_KEY = process.env.CRICAPI_KEY;
+    if (!API_KEY) {
+      console.warn('[CricAPI Warning] CRICAPI_KEY is not set in .env. Skipping cricket sync.');
+      return;
+    }
     const url = `https://api.cricapi.com/v1/currentMatches?apikey=${API_KEY}&offset=0`;
     
     const res = await axios.get(url);
