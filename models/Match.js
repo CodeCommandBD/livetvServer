@@ -16,8 +16,8 @@ const MatchSchema = new mongoose.Schema({
     flagUrl: { type: String, default: '' }
   },
   score: {
-    team1: { type: Number, default: 0 }, // Realtime goal count for team1
-    team2: { type: Number, default: 0 }  // Realtime goal count for team2
+    team1: { type: String, default: '0' }, // Realtime score (can be number for football, or string "120/4" for cricket)
+    team2: { type: String, default: '0' }  // Realtime score (can be number for football, or string "120/4" for cricket)
   },
   liveStartedAt: { type: Date, default: null }, // When admin marked as LIVE (for timer)
   channelName: { type: String, required: true }, // The NexPlay TV channel to redirect to
