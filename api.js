@@ -10,7 +10,7 @@ const Match = require('./models/Match');
 const Setting = require('./models/Setting');
 const Contact = require('./models/Contact');
 const SyncSource = require('./models/SyncSource');
-const { syncFromGitHub, checkLinks } = require('./cron');
+const { syncFromGitHub, checkLinks, getCachedCricApiScores } = require('./cron');
 const redis = require('./config/redis');
 
 // We use the same JWT Secret from .env or fallback
@@ -89,6 +89,11 @@ router.post('/admin/login', async (req, res) => {
 // ========================
 // AUTOMATION & TRENDING
 // ========================
+
+router.get('/cricket-scores', (req, res) => {
+  const scores = getCachedCricApiScores();
+  res.json(scores);
+});
 
 router.get('/trending', async (req, res) => {
   try {

@@ -572,10 +572,79 @@ const autoSyncEspnScores = async () => {
 };
 
 // ==========================================
+// 6. AUTO SYNC CRICAPI SCORES
+// ==========================================
+global.cricApiScoresCache = [];
 
-// INITIALIZE CRON JOBS
+const fetchCricApiScores = async () => {
+  try {
+    const API_KEY = 'ffe300c5-39f9-4ed1-a8ce-b1c47c7c5faf';
+    const url = `https://api.cricapi.com/v1/currentMatches?apikey=${API_KEY}&offset=0`;
+    
+    const res = await axios.get(url);
+    if (res.data && res.data.data) {
+      const formattedMatches = res.data.data.map(match => {
+        
+        let state = 'pre';
+        if (match.matchStarted && !match.matchEnded) state = 'in';
+        else if (match.matchEnded) state = 'post';
+
+        // Find scores for home and away
+        let homeScoreStr = '0';
+        let awayScoreStr = '0';
+
+        const team1 = match.teamInfo?.[0] || { name: match.teams[0] };
+        const team2 = match.teamInfo?.[1] || { name: match.teams[1] };
+
+        // Parse innings if available
+        if (match.score && Array.isArray(match.score)) {
+          // Attempt to match team names in the inning string
+          match.score.forEach(inningScore => {
+            const str = `${inningScore.r}/${inningScore.w} (${inningScore.o}v)`;
+            if (inningScore.inning.toLowerCase().includes(team1.name.toLowerCase())) {
+              homeScoreStr = str;
+            } else if (inningScore.inning.toLowerCase().includes(team2.name.toLowerCase())) {
+              awayScoreStr = str;
+            }
+          });
+        }
+
+        return {
+          id: match.id,
+          sport: 'Cricket',
+          name: match.name,
+          shortName: match.name.split(',')[0], // e.g. "India vs Pakistan"
+          state: state,
+          detail: match.status,
+          startTimeRaw: match.dateTimeGMT,
+          home: {
+            name: team1.shortname || team1.name,
+            score: homeScoreStr,
+            logo: team1.img || ''
+          },
+          away: {
+            name: team2.shortname || team2.name,
+            score: awayScoreStr,
+            logo: team2.img || ''
+          }
+        };
+      });
+
+      // Filter out 'post' matches so we only keep live and upcoming
+      global.cricApiScoresCache = formattedMatches.filter(m => m.state !== 'post');
+      // console.log(`[CricAPI] Synced ${global.cricApiScoresCache.length} live/upcoming cricket matches.`);
+    }
+  } catch (error) {
+    console.error('[CricAPI Error]', error.message);
+  }
+};
+
+// ==========================================
+// 7. INIT ALL CRON JOBS
 // ==========================================
 const initCronJobs = () => {
+  // Run on startup
+  fetchCricApiScores();
   // Run GitHub Sync twice a day (Midnight 12:00 AM and Noon 12:00 PM BD Time)
   cron.schedule('0 0,12 * * *', syncFromGitHub, {
     timezone: "Asia/Dhaka"
@@ -590,6 +659,9 @@ const initCronJobs = () => {
   // Auto-sync live scores from ESPN every 1 minute
   cron.schedule('* * * * *', autoSyncEspnScores);
 
+  // Fetch CricAPI scores every 15 minutes (to stay under 100/day limit)
+  cron.schedule('*/15 * * * *', fetchCricApiScores);
+
   // Check and auto-end old live matches every 10 minutes
   cron.schedule('*/10 * * * *', autoEndMatches);
   
@@ -602,5 +674,7 @@ module.exports = {
   checkLinks,
   autoStartMatches,
   autoEndMatches,
-  autoSyncEspnScores
+  autoSyncEspnScores,
+  fetchCricApiScores,
+  getCachedCricApiScores: () => global.cricApiScoresCache || []
 };
