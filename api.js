@@ -670,6 +670,23 @@ const auditRateLimit = new Map();
 // Cache to prevent false view inflation: IP+Channel must wait 15 mins before a new view is counted
 const viewDebounceLimit = new Map();
 
+// ✅ LOGICAL FIX: Garbage Collection for Maps to prevent Memory Leaks
+setInterval(() => {
+  const now = Date.now();
+  // Cleanup old login attempts (older than 15 mins)
+  for (const [ip, attempt] of loginAttempts.entries()) {
+    if (now - attempt.time > 15 * 60 * 1000) {
+      loginAttempts.delete(ip);
+    }
+  }
+  // Cleanup old audit rate limits (older than 2 mins)
+  for (const [ip, rate] of auditRateLimit.entries()) {
+    if (now - rate.time > 120000) {
+      auditRateLimit.delete(ip);
+    }
+  }
+}, 5 * 60 * 1000); // Run every 5 minutes
+
 // Audit Event Logging
 router.post('/audit/event', async (req, res) => {
   try {

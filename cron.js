@@ -20,7 +20,7 @@ function isSafeUrl(urlString) {
     const hostname = parsed.hostname.toLowerCase();
     
     // Block localhost, internal subnets, and AWS/Cloud metadata IPs
-    if (hostname === 'localhost' || hostname.startsWith('127.')) return false;
+    if (hostname === 'localhost' || hostname === '0.0.0.0' || hostname === '::' || hostname === '::1' || hostname.startsWith('127.')) return false;
     if (hostname === '169.254.169.254' || hostname === '[fd00:ec2::254]') return false;
     if (hostname.startsWith('10.')) return false;
     if (hostname.startsWith('192.168.')) return false;
