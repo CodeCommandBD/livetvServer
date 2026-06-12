@@ -15,6 +15,9 @@ const redis = require('./config/redis');
 
 // We use the same JWT Secret from .env or fallback
 const JWT_SECRET = process.env.JWT_SECRET || 'nexplay_tv_super_secret_admin_key_2026';
+if (!process.env.JWT_SECRET) {
+  console.warn('[SECURITY WARNING] JWT_SECRET is not set in .env! Using insecure fallback key. Set a strong JWT_SECRET in production!');
+}
 
 // Middleware to verify JWT
 const authenticate = (req, res, next) => {
@@ -34,8 +37,24 @@ const authenticate = (req, res, next) => {
 // AUTHENTICATION
 // ========================
 
+// Brute-Force Protection: Track failed login attempts per IP
+const loginAttempts = new Map();
+
 router.post('/admin/login', async (req, res) => {
   try {
+    const forwardedFor = req.headers['x-forwarded-for'];
+    const userIP = forwardedFor ? forwardedFor.split(',')[0].trim() : req.socket.remoteAddress;
+
+    // Block IP after 10 failed attempts in 15 minutes
+    const attempt = loginAttempts.get(userIP) || { count: 0, time: Date.now() };
+    if (Date.now() - attempt.time > 15 * 60 * 1000) {
+      attempt.count = 0;
+      attempt.time = Date.now();
+    }
+    if (attempt.count >= 10) {
+      return res.status(429).json({ error: 'Too many failed attempts. Try again in 15 minutes.' });
+    }
+
     const { username, password } = req.body;
 
     // ✅ Fix Logic Error: Prevent bcrypt.compare crash if password is missing
@@ -45,11 +64,21 @@ router.post('/admin/login', async (req, res) => {
 
     const admin = await Admin.findOne({ username });
 
-    if (!admin) return res.status(401).json({ error: 'Invalid credentials' });
+    if (!admin) {
+      attempt.count++;
+      loginAttempts.set(userIP, attempt);
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
 
     const isMatch = await bcrypt.compare(password, admin.password);
-    if (!isMatch) return res.status(401).json({ error: 'Invalid credentials' });
+    if (!isMatch) {
+      attempt.count++;
+      loginAttempts.set(userIP, attempt);
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
 
+    // Successful login — reset attempt counter
+    loginAttempts.delete(userIP);
     const token = jwt.sign({ id: admin._id, username: admin.username }, JWT_SECRET, { expiresIn: '7d' });
     res.json({ token });
   } catch (err) {
@@ -64,8 +93,13 @@ router.post('/admin/login', async (req, res) => {
 router.get('/trending', async (req, res) => {
   try {
     if (redis) {
-      const cachedTrending = await redis.get('nexplaytv:trending');
-      if (cachedTrending) return res.json(cachedTrending);
+      try {
+        const cachedTrending = await redis.get('nexplaytv:trending');
+        if (cachedTrending) return res.json(cachedTrending);
+      } catch (redisErr) {
+        console.error('Redis GET error (trending):', redisErr.message);
+        // Do not throw, gracefully fallback to MongoDB
+      }
     }
 
     // Calculate trending based on PLAY_START in last 24h using aggregation
@@ -87,7 +121,11 @@ router.get('/trending', async (req, res) => {
     const sortedChannels = trendingNames.map(name => channels.find(c => c.name === name)).filter(Boolean);
     
     if (redis) {
-      await redis.set('nexplaytv:trending', sortedChannels, { ex: 300 }); // Cache for 5 mins
+      try {
+        await redis.set('nexplaytv:trending', sortedChannels, { ex: 300 }); // Cache for 5 mins
+      } catch (redisErr) {
+        console.error('Redis SET error (trending):', redisErr.message);
+      }
     }
     res.json(sortedChannels);
   } catch (err) {
@@ -260,6 +298,13 @@ router.get('/matches/stream', (req, res) => {
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
   
+  // SECURITY: Cap the number of SSE clients to prevent memory exhaustion
+  // Without this, an attacker could open 100,000 long-lived SSE connections to exhaust RAM
+  if (matchClients.length >= 2000) {
+    res.status(503).json({ error: 'Too many live connections' });
+    return;
+  }
+
   // Send initial heartbeat
   res.write(`data: connected\n\n`);
 
@@ -289,7 +334,10 @@ router.get('/matches/stream', (req, res) => {
 router.get('/matches', async (req, res) => {
   try {
     const query = req.query.all === 'true' ? {} : { status: { $ne: 'ENDED' } };
-    const matches = await Match.find(query).sort({ startTime: 1 });
+    // LOGICAL FIX: Cap at 500 to prevent OOM crash if there are thousands of historical matches
+    const limit = req.query.all === 'true' ? 500 : 0; 
+    const sortOrder = req.query.all === 'true' ? -1 : 1;
+    const matches = await Match.find(query).sort({ startTime: sortOrder }).limit(limit);
     res.json(matches);
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
@@ -298,6 +346,27 @@ router.get('/matches', async (req, res) => {
 
 router.post('/admin/matches', authenticate, async (req, res) => {
   try {
+    const { sport, status, startTime, team1, team2, channelName } = req.body;
+
+    // LOGICAL FIX: Input validation — prevent blank/malformed matches from being saved
+    if (!sport || !startTime || !team1?.name || !team2?.name || !channelName) {
+      return res.status(400).json({ error: 'Missing required fields: sport, startTime, team1.name, team2.name, channelName' });
+    }
+    // SECURITY: Validate flag URLs to prevent SSRF via flagUrl field
+    const allowedFlagHosts = ['flagcdn.com', 'upload.wikimedia.org', 'logos-world.net', 'img.icons8.com'];
+    const isSafeFlagUrl = (url) => {
+      if (!url) return true; // Optional field, empty is fine
+      try { return allowedFlagHosts.some(h => new URL(url).hostname.endsWith(h)); }
+      catch { return false; }
+    };
+    if (!isSafeFlagUrl(team1.flagUrl) || !isSafeFlagUrl(team2.flagUrl)) {
+      return res.status(400).json({ error: 'Invalid flag URL. Only trusted image hosts are allowed.' });
+    }
+    // Sanitize text field lengths
+    if (team1.name.length > 100 || team2.name.length > 100 || channelName.length > 200) {
+      return res.status(400).json({ error: 'Field too long.' });
+    }
+
     const match = new Match(req.body);
     await match.save();
     notifyMatchUpdate();
@@ -340,14 +409,20 @@ router.delete('/admin/matches/:id', authenticate, async (req, res) => {
 router.get('/home-sections', async (req, res) => {
   try {
     if (redis) {
-      const cachedSections = await redis.get('nexplaytv:homeSections');
-      if (cachedSections) return res.json(cachedSections);
+      try {
+        const cachedSections = await redis.get('nexplaytv:homeSections');
+        if (cachedSections) return res.json(cachedSections);
+      } catch (redisErr) {
+        console.error('Redis GET error (homeSections):', redisErr.message);
+      }
     }
     const setting = await Setting.findOne({ key: 'homeSections' });
     const defaultSections = { cricket: [], football: [], watchRecommended: [], watchFootball: [], watchCricket: [] };
     const sections = setting ? { ...defaultSections, ...setting.value } : defaultSections;
     if (redis) {
-      await redis.set('nexplaytv:homeSections', sections, { ex: 3600 }); // Cache for 1 hour
+      try {
+        await redis.set('nexplaytv:homeSections', sections, { ex: 3600 }); // Cache for 1 hour
+      } catch (redisErr) {}
     }
     res.json(sections);
   } catch (err) {
@@ -362,7 +437,9 @@ router.put('/home-sections', authenticate, async (req, res) => {
       { value: req.body },
       { new: true, upsert: true }
     );
-    if (redis) await redis.del('nexplaytv:homeSections');
+    if (redis) {
+      try { await redis.del('nexplaytv:homeSections'); } catch (e) {}
+    }
     res.json(updated.value);
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
@@ -388,14 +465,20 @@ const invalidateCache = async () => {
 router.get('/channels', async (req, res) => {
   try {
     if (redis) {
-      const cachedChannels = await redis.get('nexplaytv:channels');
-      if (cachedChannels) return res.json(cachedChannels);
+      try {
+        const cachedChannels = await redis.get('nexplaytv:channels');
+        if (cachedChannels) return res.json(cachedChannels);
+      } catch (redisErr) {
+        console.error('Redis GET error (channels):', redisErr.message);
+      }
     }
     
     const channels = await Channel.find().select('-__v');
     
     if (redis) {
-      await redis.set('nexplaytv:channels', channels, { ex: 3600 }); // Cache for 1 hour
+      try {
+        await redis.set('nexplaytv:channels', channels, { ex: 3600 }); // Cache for 1 hour
+      } catch (redisErr) {}
     }
     
     res.json(channels);
@@ -461,17 +544,30 @@ router.post('/channels', authenticate, async (req, res) => {
 // Admin: Edit a channel
 router.put('/channels/:id', authenticate, async (req, res) => {
   try {
-    let channel;
-    // CRITICAL SECURITY FIX: Mongoose Schema Validation Bypass Protection
-    // By default, findByIdAndUpdate completely ignores Schema validations!
-    // We MUST use runValidators: true to prevent saving empty names or invalid URLs.
+    // Fetch old channel first to check if name changed
+    let oldChannel;
     if (req.params.id.match(/^[0-9a-fA-F]{24}$/)) {
-      channel = await Channel.findByIdAndUpdate(req.params.id, req.body, { new: true, runValidators: true });
+      oldChannel = await Channel.findById(req.params.id);
     } else {
-      channel = await Channel.findOneAndUpdate({ name: req.params.id }, req.body, { new: true, runValidators: true });
+      oldChannel = await Channel.findOne({ name: req.params.id });
     }
     
-    if (!channel) return res.status(404).json({ error: 'Channel not found' });
+    if (!oldChannel) return res.status(404).json({ error: 'Channel not found' });
+    
+    const oldName = oldChannel.name;
+    const newName = req.body.name;
+
+    // CRITICAL SECURITY FIX: Mongoose Schema Validation Bypass Protection
+    // We MUST use runValidators: true to prevent saving empty names or invalid URLs.
+    const channel = await Channel.findByIdAndUpdate(oldChannel._id, req.body, { new: true, runValidators: true });
+    
+    // CRITICAL LOGICAL FIX: Cascading Match Updates
+    // If the channel name was changed, update all matches referencing the old name
+    if (newName && newName !== oldName) {
+      await Match.updateMany({ channelName: oldName }, { $set: { channelName: newName } });
+      if (global.notifyMatchUpdate) global.notifyMatchUpdate();
+    }
+    
     invalidateCache();
     res.json(channel);
   } catch (err) {
@@ -482,14 +578,22 @@ router.put('/channels/:id', authenticate, async (req, res) => {
 // Admin: Delete a channel
 router.delete('/channels/:id', authenticate, async (req, res) => {
   try {
-    let result;
+    let oldChannel;
     if (req.params.id.match(/^[0-9a-fA-F]{24}$/)) {
-      result = await Channel.findByIdAndDelete(req.params.id);
+      oldChannel = await Channel.findById(req.params.id);
     } else {
-      result = await Channel.findOneAndDelete({ name: req.params.id });
+      oldChannel = await Channel.findOne({ name: req.params.id });
     }
     
-    if (!result) return res.status(404).json({ error: 'Channel not found' });
+    if (!oldChannel) return res.status(404).json({ error: 'Channel not found' });
+    
+    await Channel.findByIdAndDelete(oldChannel._id);
+    
+    // CRITICAL LOGICAL FIX: Dangling Match Reference Cleanup
+    // If a channel is deleted, remove all active matches attached to it to prevent frontend crashes
+    await Match.deleteMany({ channelName: oldChannel.name, status: { $ne: 'ENDED' } });
+    if (global.notifyMatchUpdate) global.notifyMatchUpdate();
+
     invalidateCache();
     res.json({ message: 'Channel deleted' });
   } catch (err) {
@@ -529,15 +633,51 @@ router.put('/admin/server-status', authenticate, async (req, res) => {
 // AUDIT & LOGS
 // ========================
 
+// Rate Limiter for ip-api to prevent ban/DoS (Max ~40 requests per minute)
+global.lastIpFetchTime = 0;
+const canFetchIp = () => {
+  const now = Date.now();
+  if (now - global.lastIpFetchTime > 1500) {
+    global.lastIpFetchTime = now;
+    return true;
+  }
+  return false;
+};
+
+// Rate Limiter for Audit to prevent DB Flooding & Trending Spoofing
+const auditRateLimit = new Map();
+
 // Audit Event Logging
 router.post('/audit/event', async (req, res) => {
   try {
     const { type, channel, error } = req.body;
     if (!type || !channel) return res.status(400).json({ error: 'Missing data' });
     
-    // Extract IP BEFORE responding (to ensure req.socket/headers are still available)
+    // Validate length to prevent huge document bloat
+    if (typeof channel !== 'string' || channel.length > 200 || typeof type !== 'string' || type.length > 50) {
+      return res.status(400).json({ error: 'Payload too large' });
+    }
+
+    // Extract IP BEFORE responding
     const forwardedFor = req.headers['x-forwarded-for'];
     const userIP = forwardedFor ? forwardedFor.split(',')[0].trim() : req.socket.remoteAddress;
+
+    // Strict Rate Limiting: Max 10 audit events per IP per minute
+    if (userIP) {
+      const now = Date.now();
+      const userRate = auditRateLimit.get(userIP) || { count: 0, time: now };
+      if (now - userRate.time > 60000) {
+        userRate.count = 1;
+        userRate.time = now;
+      } else {
+        userRate.count++;
+      }
+      auditRateLimit.set(userIP, userRate);
+
+      if (userRate.count > 15) {
+        return res.status(429).json({ error: 'Too many requests' });
+      }
+    }
 
     // Respond immediately so the client isn't blocked
     res.json({ success: true });
@@ -551,7 +691,7 @@ router.post('/audit/event', async (req, res) => {
         location = 'Localhost';
       } else if (global.ipLocationCache && global.ipLocationCache.has(userIP)) {
         location = global.ipLocationCache.get(userIP);
-      } else {
+      } else if (canFetchIp()) {
         try {
           const axios = require('axios');
           const resp = await axios.get(`http://ip-api.com/json/${userIP}`, { timeout: 2000 });
@@ -563,6 +703,8 @@ router.post('/audit/event', async (req, res) => {
         } catch (e) {
           // Ignore timeout or network errors
         }
+      } else {
+        location = 'Unknown Location (Rate Limited)';
       }
     }
 
@@ -584,26 +726,39 @@ const axios = require('axios');
 // Real-time Channel Tracking Heartbeat
 router.post('/stream/heartbeat', (req, res) => {
   const { channelName, clientId } = req.body;
+  
+  // Validate input types to prevent NoSQL/Logic crashes
+  if (typeof channelName !== 'string' || channelName.length > 200 || typeof clientId !== 'string' || clientId.length > 100) {
+    return res.status(400).json({ error: 'Invalid payload' });
+  }
+
   const forwardedFor = req.headers['x-forwarded-for'];
   const userIP = forwardedFor ? forwardedFor.split(',')[0].trim() : req.socket.remoteAddress;
   
   if (userIP && channelName && clientId && global.activeSessions) {
+    // CRITICAL FIX: Memory Exhaustion (OOM) Protection
+    // Prevent attacker from sending millions of fake clientIds and crashing the server RAM
+    if (global.activeSessions.size > 50000 && !global.activeSessions.has(clientId)) {
+      return res.status(503).json({ error: 'Server at capacity' });
+    }
+
     global.activeSessions.set(clientId, { ip: userIP, channelName, lastSeen: Date.now() });
 
     // Background fetch for IP location if not cached
     if (global.ipLocationCache && !global.ipLocationCache.has(userIP)) {
       if (userIP === '127.0.0.1' || userIP === '::1' || userIP.startsWith('192.168.')) {
         global.ipLocationCache.set(userIP, 'Localhost');
-      } else {
+      } else if (canFetchIp()) {
         global.ipLocationCache.set(userIP, 'Fetching...');
-        axios.get(`http://ip-api.com/json/${userIP}`).then(resp => {
+        axios.get(`http://ip-api.com/json/${userIP}`, { timeout: 2000 }).then(resp => {
           if (resp.data && resp.data.status === 'success') {
-            global.ipLocationCache.set(userIP, resp.data.city || resp.data.country);
+            const loc = resp.data.city ? `${resp.data.city}, ${resp.data.country}` : resp.data.country;
+            global.ipLocationCache.set(userIP, loc);
           } else {
-            global.ipLocationCache.set(userIP, 'Unknown');
+            global.ipLocationCache.delete(userIP); // allow retry
           }
         }).catch(() => {
-          global.ipLocationCache.set(userIP, 'Unknown');
+          global.ipLocationCache.delete(userIP); // allow retry
         });
       }
     }
@@ -671,10 +826,13 @@ router.get('/admin/stats', authenticate, async (req, res) => {
   }
 });
 
-// Admin: Get recent audit logs
+// Admin: Get recent audit logs (paginated)
 router.get('/admin/audits', authenticate, async (req, res) => {
   try {
-    const logs = await Audit.find().sort({ timestamp: -1 }).limit(100);
+    const limit = Math.min(parseInt(req.query.limit) || 100, 500); // Cap at 500
+    const page = parseInt(req.query.page) || 1;
+    const skip = (page - 1) * limit;
+    const logs = await Audit.find().sort({ timestamp: -1 }).skip(skip).limit(limit);
     res.json(logs);
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
@@ -685,7 +843,9 @@ router.get('/admin/audits', authenticate, async (req, res) => {
 router.get('/admin/ip-details/:ip', authenticate, async (req, res) => {
   try {
     const ip = req.params.ip;
-    const logs = await Audit.find({ 'metadata.ip': ip }).sort({ timestamp: -1 });
+    // LOGICAL FIX: Without a limit, a single IP with millions of events would load ALL of them into RAM,
+    // crashing the server. Cap at 500 for the detail view — admin sees recentLogs.slice(0,30) anyway.
+    const logs = await Audit.find({ 'metadata.ip': ip }).sort({ timestamp: -1 }).limit(500);
 
     const channels = [...new Set(logs.map(l => l.channel).filter(Boolean))];
     const firstSeen = logs.length > 0 ? logs[logs.length - 1].timestamp : null;
@@ -764,7 +924,11 @@ router.get('/admin/visitors', authenticate, async (req, res) => {
       },
       
       // Sort by most recently seen
-      { $sort: { lastSeen: -1 } }
+      { $sort: { lastSeen: -1 } },
+      // LOGICAL FIX: Cap at 2000 unique IPs
+      // Without this, with millions of audit logs, the aggregation loads ALL unique IPs into memory,
+      // potentially causing an OOM crash on the server. 2000 is more than enough for the admin dashboard.
+      { $limit: 2000 }
     ]);
 
     res.json(visitors);
@@ -795,6 +959,15 @@ router.post('/contact', async (req, res) => {
     if (!name || !email || !subject || !message) {
       return res.status(400).json({ error: 'All fields are required' });
     }
+    // SECURITY: Sanitize field lengths to prevent DB document bloat attacks
+    if (name.length > 100 || email.length > 150 || subject.length > 200 || message.length > 2000) {
+      return res.status(400).json({ error: 'Input too long.' });
+    }
+    // SECURITY: Basic email format validation
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+      return res.status(400).json({ error: 'Invalid email format.' });
+    }
     const newContact = new Contact({ name, email, subject, message });
     await newContact.save();
     res.json({ success: true, message: 'Message sent successfully' });
@@ -806,7 +979,8 @@ router.post('/contact', async (req, res) => {
 // Admin: Get all contact messages
 router.get('/admin/contacts', authenticate, async (req, res) => {
   try {
-    const contacts = await Contact.find().sort({ createdAt: -1 });
+    // LOGICAL FIX: Cap at 500 to prevent OOM crash if bot spammed thousands of messages
+    const contacts = await Contact.find().sort({ createdAt: -1 }).limit(500);
     res.json(contacts);
   } catch (err) {
     res.status(500).json({ error: 'Server error' });

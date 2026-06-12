@@ -6,11 +6,14 @@ const MatchSchema = new mongoose.Schema({
   startTime: { type: Date, required: true },
   team1: {
     name: { type: String, required: true },
-    flagUrl: { type: String, required: true }
+    // LOGICAL FIX: flagUrl should NOT be required.
+    // Club teams (e.g. Man City vs Arsenal) don't have country flag URLs.
+    // Making it required blocks creating club football matches entirely!
+    flagUrl: { type: String, default: '' }
   },
   team2: {
     name: { type: String, required: true },
-    flagUrl: { type: String, required: true }
+    flagUrl: { type: String, default: '' }
   },
   channelName: { type: String, required: true }, // The NexPlay TV channel to redirect to
   createdAt: { type: Date, default: Date.now }

@@ -28,7 +28,10 @@ app.use(cors({
   },
   credentials: true
 }));
-app.use(express.json());
+// SECURITY: Limit request body to 100KB to prevent JSON body DoS attacks
+// Without this, an attacker can POST a 500MB JSON payload, crashing the Node process
+app.use(express.json({ limit: '100kb' }));
+app.use(express.urlencoded({ extended: false, limit: '100kb' }));
 
 const server = http.createServer(app);
 const io = new Server(server, {
@@ -86,7 +89,20 @@ io.on('connection', (socket) => {
   // ============================
   
   socket.on('join_party', ({ partyId, nickname }) => {
-    if (!partyId || !nickname) return;
+    if (!partyId || !nickname || nickname.length > 50) return;
+    
+    // CRITICAL LOGICAL FIX: Chat Spillage Prevention
+    // If a user switches parties, they must leave the old room first to stop receiving old chats
+    const prevUser = partyUsers.get(socket.id);
+    if (prevUser && prevUser.partyId !== partyId) {
+      const oldRoom = `party_${prevUser.partyId}`;
+      socket.leave(oldRoom);
+      socket.to(oldRoom).emit('party_notification', {
+        type: 'leave',
+        message: `${prevUser.nickname} left the party.`,
+        timestamp: Date.now()
+      });
+    }
     
     const roomName = `party_${partyId}`;
     socket.join(roomName);
@@ -101,13 +117,17 @@ io.on('connection', (socket) => {
     });
   });
 
-  socket.on('send_party_chat', ({ partyId, nickname, message }) => {
-    if (!partyId || !nickname || !message || message.length > 500) return;
+  socket.on('send_party_chat', ({ message }) => {
+    // CRITICAL SECURITY FIX: Chat Spoofing & Unauthorized Broadcast
+    // Never trust client-provided partyId or nickname for chat messages.
+    // Fetch them from the secure server-side Map to ensure the user is actually in the party!
+    const user = partyUsers.get(socket.id);
+    if (!user || !message || message.length > 500) return;
     
-    const roomName = `party_${partyId}`;
+    const roomName = `party_${user.partyId}`;
     // Broadcast to everyone in the room EXCEPT sender
     socket.to(roomName).emit('receive_party_chat', {
-      nickname,
+      nickname: user.nickname,
       message,
       timestamp: Date.now()
     });
@@ -386,11 +406,13 @@ app.get('/proxy', async (req, res) => {
       // chunk from the IPTV server into oblivion, wasting massive bandwidth and RAM!
       res.on('close', () => {
         if (!res.writableEnded && response.data && typeof response.data.destroy === 'function') {
+          response.data.on('error', () => {}); // Prevent unhandled error crash
           response.data.destroy();
         }
       });
       res.on('error', () => {
         if (response.data && typeof response.data.destroy === 'function') {
+          response.data.on('error', () => {}); // Prevent unhandled error crash
           response.data.destroy();
         }
       });

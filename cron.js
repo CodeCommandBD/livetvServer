@@ -132,10 +132,20 @@ const syncFromGitHub = async () => {
     }
 
     // ✅ Deduplicate by name BEFORE hitting DB — first-seen (higher priority source) wins
+    // SECURITY FIX: Sanitize logo/group fields from untrusted source data
+    // A malicious M3U source could inject a huge logo URL (e.g. 1MB string) to bloat the DB
     const dedupedMap = new Map();
     for (const ch of allNewChannels) {
       if (ch.name && ch.url && !dedupedMap.has(ch.name)) {
-        dedupedMap.set(ch.name, ch);
+        // Sanitize: cap field lengths to prevent DB document bloat
+        const safeCh = {
+          ...ch,
+          name: ch.name.substring(0, 200),
+          url: ch.url.substring(0, 1000),
+          logo: ch.logo ? ch.logo.substring(0, 500) : '',
+          group: ch.group ? ch.group.substring(0, 100) : 'Uncategorized'
+        };
+        dedupedMap.set(safeCh.name, safeCh);
       }
     }
     const dedupedChannels = Array.from(dedupedMap.values());
