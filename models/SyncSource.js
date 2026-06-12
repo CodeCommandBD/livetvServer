@@ -2,7 +2,7 @@ const mongoose = require('mongoose');
 
 const SyncSourceSchema = new mongoose.Schema({
   name: { type: String, required: true, trim: true },
-  url: { type: String, required: true, trim: true },
+  url: { type: String, required: true, trim: true, unique: true },
   // 'json' for JSON arrays, 'm3u' for M3U/M3U8 playlists
   type: { type: String, enum: ['json', 'm3u'], required: true },
   enabled: { type: Boolean, default: true },

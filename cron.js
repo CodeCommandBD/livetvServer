@@ -7,9 +7,30 @@ const Match = require('./models/Match');
 const SyncSource = require('./models/SyncSource');
 const redis = require('./config/redis');
 
+const { URL } = require('url');
+
 // Regex to detect any valid streaming URL protocol
 // Fixes RTMP/RTSP skip bug where only 'http' was checked before
 const STREAM_URL_REGEX = /^(https?|rtmp|rtmps|rtsp|udp):///i;
+
+// Function to prevent Server-Side Request Forgery (SSRF)
+function isSafeUrl(urlString) {
+  try {
+    const parsed = new URL(urlString);
+    const hostname = parsed.hostname.toLowerCase();
+    
+    // Block localhost, internal subnets, and AWS/Cloud metadata IPs
+    if (hostname === 'localhost' || hostname.startsWith('127.')) return false;
+    if (hostname === '169.254.169.254' || hostname === '[fd00:ec2::254]') return false;
+    if (hostname.startsWith('10.')) return false;
+    if (hostname.startsWith('192.168.')) return false;
+    if (/^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(hostname)) return false;
+    
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
 
 // ==========================================
 // 1. AUTO SYNC (reads sources from DB)
@@ -30,7 +51,17 @@ const syncFromGitHub = async () => {
     for (const source of sources) {
       try {
         console.log(`[Cron] Fetching "${source.name}" → ${source.url}`);
-        const res = await axios.get(source.url, { timeout: 20000 });
+        
+        // Security: Block SSRF attacks
+        if (!isSafeUrl(source.url)) {
+          throw new Error('Unsafe URL detected. Connection blocked.');
+        }
+
+        const res = await axios.get(source.url, { 
+          timeout: 20000,
+          maxContentLength: 10 * 1024 * 1024, // 10MB limit (DoS Protection)
+          maxBodyLength: 10 * 1024 * 1024
+        });
         let parsedChannels = [];
 
         if (source.type === 'm3u') {

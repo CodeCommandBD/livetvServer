@@ -186,25 +186,40 @@ router.post('/sync-sources', authenticate, async (req, res) => {
     await source.save();
     res.status(201).json(source);
   } catch (err) {
+    if (err.code === 11000) {
+      return res.status(409).json({ error: 'This URL already exists in Sync Sources.' });
+    }
     res.status(500).json({ error: 'Server error' });
   }
 });
 
-// PUT — toggle enabled/disabled
+// PUT — update a sync source (enabled, name, url, type)
 router.put('/sync-sources/:id', authenticate, async (req, res) => {
   try {
-    const { enabled } = req.body;
-    if (typeof enabled !== 'boolean') {
-      return res.status(400).json({ error: '"enabled" must be a boolean.' });
+    const { enabled, name, url, type } = req.body;
+    
+    // Build update object dynamically
+    const updateData = {};
+    if (typeof enabled === 'boolean') updateData.enabled = enabled;
+    if (name) updateData.name = name.trim();
+    if (url) updateData.url = url.trim();
+    if (type && ['json', 'm3u'].includes(type)) updateData.type = type;
+
+    if (Object.keys(updateData).length === 0) {
+      return res.status(400).json({ error: 'No valid fields provided for update.' });
     }
+
     const source = await SyncSource.findByIdAndUpdate(
       req.params.id,
-      { enabled },
-      { new: true }
+      { $set: updateData },
+      { new: true, runValidators: true }
     );
     if (!source) return res.status(404).json({ error: 'Source not found.' });
     res.json(source);
   } catch (err) {
+    if (err.code === 11000) {
+      return res.status(409).json({ error: 'This URL already exists in Sync Sources.' });
+    }
     res.status(500).json({ error: 'Server error' });
   }
 });
