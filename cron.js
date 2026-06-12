@@ -597,18 +597,22 @@ const fetchCricApiScores = async () => {
         let homeScoreStr = '0';
         let awayScoreStr = '0';
 
-        const team1 = match.teamInfo?.[0] || { name: match.teams[0] };
-        const team2 = match.teamInfo?.[1] || { name: match.teams[1] };
+        // Safely extract team names to prevent crashes if API data is malformed
+        const team1 = match.teamInfo?.[0] || { name: match.teams?.[0] || 'Team 1' };
+        const team2 = match.teamInfo?.[1] || { name: match.teams?.[1] || 'Team 2' };
 
         // Parse innings if available
         if (match.score && Array.isArray(match.score)) {
           // Attempt to match team names in the inning string
           match.score.forEach(inningScore => {
-            const str = `${inningScore.r}/${inningScore.w} (${inningScore.o}v)`;
-            if (inningScore.inning.toLowerCase().includes(team1.name.toLowerCase())) {
-              homeScoreStr = str;
-            } else if (inningScore.inning.toLowerCase().includes(team2.name.toLowerCase())) {
-              awayScoreStr = str;
+            if (inningScore && inningScore.inning) {
+              const str = `${inningScore.r || 0}/${inningScore.w || 0} (${inningScore.o || 0}v)`;
+              const inningName = inningScore.inning.toLowerCase();
+              if (team1.name && inningName.includes(team1.name.toLowerCase())) {
+                homeScoreStr = str;
+              } else if (team2.name && inningName.includes(team2.name.toLowerCase())) {
+                awayScoreStr = str;
+              }
             }
           });
         }
@@ -616,11 +620,11 @@ const fetchCricApiScores = async () => {
         return {
           id: match.id,
           sport: 'Cricket',
-          name: match.name,
-          shortName: match.name.split(',')[0], // e.g. "India vs Pakistan"
+          name: match.name || 'Unknown Match',
+          shortName: match.name ? match.name.split(',')[0] : 'Unknown Match', // e.g. "India vs Pakistan"
           state: state,
-          detail: match.status,
-          startTimeRaw: match.dateTimeGMT,
+          detail: match.status || '',
+          startTimeRaw: match.dateTimeGMT || null,
           home: {
             name: team1.shortname || team1.name,
             score: homeScoreStr,
