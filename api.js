@@ -874,10 +874,17 @@ router.get('/admin/stats', authenticate, async (req, res) => {
 // Admin: Get recent audit logs (paginated)
 router.get('/admin/audits', authenticate, async (req, res) => {
   try {
-    const limit = Math.min(parseInt(req.query.limit) || 100, 500); // Cap at 500
+    const limit = Math.min(parseInt(req.query.limit) || 200, 1000); // Increased cap to 1000
     const page = parseInt(req.query.page) || 1;
     const skip = (page - 1) * limit;
-    const logs = await Audit.find().sort({ timestamp: -1 }).skip(skip).limit(limit);
+    
+    // Server-side filtering
+    const query = {};
+    if (req.query.type && req.query.type !== 'ALL') {
+      query.type = req.query.type;
+    }
+
+    const logs = await Audit.find(query).sort({ timestamp: -1 }).skip(skip).limit(limit);
     res.json(logs);
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
