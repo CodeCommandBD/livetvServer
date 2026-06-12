@@ -228,9 +228,10 @@ const checkLinks = async () => {
   console.log('[Cron] Starting Link Checker Batch...');
   
   try {
-    // Pick 50 random channels that are not already marked as dead
+    // Pick 50 random channels (both live and dead)
+    // ✅ Bug Fix 3: Removed { status: { $ne: 'dead' } }
+    // Dead channels must be checked periodically to see if the server came back online!
     const batch = await Channel.aggregate([
-      { $match: { status: { $ne: 'dead' } } },
       { $sample: { size: 50 } }
     ]);
 
@@ -243,6 +244,12 @@ const checkLinks = async () => {
         if (!channel.url || !channel.url.startsWith('http')) {
           await Channel.findByIdAndUpdate(channel._id, { status: 'dead' });
           return 'dead'; // ✅ Bug Fix 1: Return result instead of mutating shared counter
+        }
+        
+        // Security: Block SSRF in link checker
+        if (!isSafeUrl(channel.url)) {
+          await Channel.findByIdAndUpdate(channel._id, { status: 'dead' });
+          return 'dead';
         }
         
         const startPing = Date.now();
