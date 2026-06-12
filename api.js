@@ -646,6 +646,8 @@ const canFetchIp = () => {
 
 // Rate Limiter for Audit to prevent DB Flooding & Trending Spoofing
 const auditRateLimit = new Map();
+// Cache to prevent false view inflation: IP+Channel must wait 15 mins before a new view is counted
+const viewDebounceLimit = new Map();
 
 // Audit Event Logging
 router.post('/audit/event', async (req, res) => {
@@ -683,6 +685,28 @@ router.post('/audit/event', async (req, res) => {
     res.json({ success: true });
 
     // Process asynchronously
+    
+    // ✅ LOGICAL FIX: Deep Deduplication of PLAY_START
+    // Prevent 1 user from generating 100 views by refreshing the page or switching tabs rapidly.
+    // An IP can only log 1 view per channel every 15 minutes.
+    if (type === 'PLAY_START' && userIP) {
+      const viewKey = `${userIP}_${channel}`;
+      const lastViewTime = viewDebounceLimit.get(viewKey);
+      const now = Date.now();
+      
+      if (lastViewTime && (now - lastViewTime < 15 * 60 * 1000)) {
+        return; // Silently drop duplicate view logic
+      }
+      viewDebounceLimit.set(viewKey, now);
+      
+      // Prevent memory leak by occasionally cleaning up old entries
+      if (viewDebounceLimit.size > 5000) {
+        const oldestAllowed = now - 15 * 60 * 1000;
+        for (const [key, time] of viewDebounceLimit.entries()) {
+          if (time < oldestAllowed) viewDebounceLimit.delete(key);
+        }
+      }
+    }
     
     let location = 'Unknown Location';
     
