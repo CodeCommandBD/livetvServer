@@ -268,7 +268,7 @@ const checkLinks = async () => {
           return 'live';
         }
 
-        if (!channel.url || !channel.url.startsWith('http')) {
+        if (!channel.url || !STREAM_URL_REGEX.test(channel.url)) {
           await Channel.findByIdAndUpdate(channel._id, { status: 'dead' });
           return 'dead'; // ✅ Bug Fix 1: Return result instead of mutating shared counter
         }
@@ -277,6 +277,12 @@ const checkLinks = async () => {
         if (!isSafeUrl(channel.url)) {
           await Channel.findByIdAndUpdate(channel._id, { status: 'dead' });
           return 'dead';
+        }
+
+        // Axios only supports HTTP/HTTPS. We cannot automatically ping RTMP/RTSP/UDP streams here.
+        // Assume non-HTTP streams are alive (or untouched) since we lack a protocol-specific checker.
+        if (!channel.url.toLowerCase().startsWith('http')) {
+          return 'unknown';
         }
         
         const startPing = Date.now();
@@ -585,7 +591,8 @@ const fetchCricApiScores = async () => {
     }
     const url = `https://api.cricapi.com/v1/currentMatches?apikey=${API_KEY}&offset=0`;
     
-    const res = await axios.get(url);
+    // Add a 10s timeout so the request doesn't hang indefinitely and cause memory leaks
+    const res = await axios.get(url, { timeout: 10000 });
     if (res.data && res.data.data) {
       const formattedMatches = res.data.data.map(match => {
         
@@ -603,15 +610,39 @@ const fetchCricApiScores = async () => {
 
         // Parse innings if available
         if (match.score && Array.isArray(match.score)) {
-          // Attempt to match team names in the inning string
+          // First pass: Assign scores that unambiguously belong to one team
           match.score.forEach(inningScore => {
             if (inningScore && inningScore.inning) {
               const str = `${inningScore.r || 0}/${inningScore.w || 0} (${inningScore.o || 0}v)`;
               const inningName = inningScore.inning.toLowerCase();
-              if (team1.name && inningName.includes(team1.name.toLowerCase())) {
+              
+              const hasT1 = team1.name && inningName.includes(team1.name.toLowerCase());
+              const hasT2 = team2.name && inningName.includes(team2.name.toLowerCase());
+
+              if (hasT1 && !hasT2) {
                 homeScoreStr = str;
-              } else if (team2.name && inningName.includes(team2.name.toLowerCase())) {
+              } else if (hasT2 && !hasT1) {
                 awayScoreStr = str;
+              }
+            }
+          });
+
+          // Second pass: CricAPI edge case - second inning strings often contain BOTH team names (e.g. "Team1,Team2 Inning 1")
+          match.score.forEach(inningScore => {
+            if (inningScore && inningScore.inning) {
+              const str = `${inningScore.r || 0}/${inningScore.w || 0} (${inningScore.o || 0}v)`;
+              const inningName = inningScore.inning.toLowerCase();
+              
+              const hasT1 = team1.name && inningName.includes(team1.name.toLowerCase());
+              const hasT2 = team2.name && inningName.includes(team2.name.toLowerCase());
+
+              // If it contains both, assign it to the team that doesn't have a score yet
+              if (hasT1 && hasT2) {
+                if (homeScoreStr === '0' && awayScoreStr !== '0') {
+                  homeScoreStr = str;
+                } else if (awayScoreStr === '0' && homeScoreStr !== '0') {
+                  awayScoreStr = str;
+                }
               }
             }
           });
