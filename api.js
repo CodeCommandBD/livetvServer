@@ -299,17 +299,16 @@ const notifyMatchUpdate = () => {
 global.notifyMatchUpdate = notifyMatchUpdate;
 
 router.get('/matches/stream', (req, res) => {
+  // SECURITY: Cap the number of SSE clients to prevent memory exhaustion
+  // Without this, an attacker could open 100,000 long-lived SSE connections to exhaust RAM
+  if (matchClients.length >= 2000) {
+    return res.status(503).json({ error: 'Too many live connections' });
+  }
+
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
   
-  // SECURITY: Cap the number of SSE clients to prevent memory exhaustion
-  // Without this, an attacker could open 100,000 long-lived SSE connections to exhaust RAM
-  if (matchClients.length >= 2000) {
-    res.status(503).json({ error: 'Too many live connections' });
-    return;
-  }
-
   // Send initial heartbeat
   res.write(`data: connected\n\n`);
 
@@ -688,6 +687,8 @@ const canFetchIp = () => {
 const auditRateLimit = new Map();
 // Cache to prevent false view inflation: IP+Channel must wait 15 mins before a new view is counted
 const viewDebounceLimit = new Map();
+// Rate Limiter for Contact Messages to prevent database spamming (Max 3 messages per IP per hour)
+const contactRateLimit = new Map();
 
 // ✅ LOGICAL FIX: Garbage Collection for Maps to prevent Memory Leaks
 setInterval(() => {
@@ -702,6 +703,12 @@ setInterval(() => {
   for (const [ip, rate] of auditRateLimit.entries()) {
     if (now - rate.time > 120000) {
       auditRateLimit.delete(ip);
+    }
+  }
+  // Cleanup old contact rate limits (older than 1 hour)
+  for (const [ip, rate] of contactRateLimit.entries()) {
+    if (now - rate.time > 60 * 60 * 1000) {
+      contactRateLimit.delete(ip);
     }
   }
   // Cleanup old view debounce entries (older than 15 mins)
@@ -1043,6 +1050,26 @@ router.delete('/admin/logs', authenticate, async (req, res) => {
 // Public: Submit contact message
 router.post('/contact', async (req, res) => {
   try {
+    const forwardedFor = req.headers['x-forwarded-for'];
+    const userIP = forwardedFor ? forwardedFor.split(',')[0].trim() : req.socket.remoteAddress;
+
+    // Rate Limiting: Max 3 contact messages per IP per hour
+    if (userIP) {
+      const now = Date.now();
+      const userRate = contactRateLimit.get(userIP) || { count: 0, time: now };
+      if (now - userRate.time > 60 * 60 * 1000) {
+        userRate.count = 1;
+        userRate.time = now;
+      } else {
+        userRate.count++;
+      }
+      contactRateLimit.set(userIP, userRate);
+
+      if (userRate.count > 3) {
+        return res.status(429).json({ error: 'Too many messages. Please try again in an hour.' });
+      }
+    }
+
     const { name, email, subject, message } = req.body;
     if (!name || !email || !subject || !message) {
       return res.status(400).json({ error: 'All fields are required' });

@@ -17,4 +17,7 @@ AuditSchema.index({ timestamp: 1 }, { expireAfterSeconds: 5 * 24 * 60 * 60 });
 // 'sparse: true' means documents without metadata.ip are excluded from the index
 AuditSchema.index({ 'metadata.ip': 1 }, { sparse: true });
 
+// ✅ Performance Fix: Compound Index for fast aggregation/counts by type and time
+AuditSchema.index({ type: 1, timestamp: -1 });
+
 module.exports = mongoose.model('Audit', AuditSchema);
