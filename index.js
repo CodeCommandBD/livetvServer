@@ -281,14 +281,30 @@ app.get('/ping', (req, res) => {
 // LOGICAL FIX: Connection Multiplexing Agents (Anti-Block Architecture)
 // Instead of creating a new TCP socket for every video chunk, we keep a pool of open sockets.
 // This prevents upstream servers (like Bein Sports) from banning our IP due to rapid socket creation.
-const keepAliveAgentHttp = new http.Agent({ keepAlive: true, maxSockets: 100, keepAliveMsecs: 30000 });
-const keepAliveAgentHttps = new https.Agent({ keepAlive: true, maxSockets: 100, keepAliveMsecs: 30000 });
+// Added socket timeout of 15s to automatically release hung/silent sockets.
+const keepAliveAgentHttp = new http.Agent({ 
+  keepAlive: true, 
+  maxSockets: 150, 
+  keepAliveMsecs: 30000,
+  timeout: 15000 
+});
+const keepAliveAgentHttps = new https.Agent({ 
+  keepAlive: true, 
+  maxSockets: 150, 
+  keepAliveMsecs: 30000,
+  timeout: 15000 
+});
 
 // LOGICAL FIX: Proxy Deduplication & Caching
 // Prevents upstream IPTV servers from banning our IP when multiple users
-// watch the same channel. We cache playlists (.m3u8) for 2s and chunks (.ts) for 15s.
+// watch the same channel. We cache playlists (.m3u8) with jitter and chunks (.ts) for 30s.
 const proxyCache = new Map(); // url -> { data: Buffer|String, expires: number, contentType: string }
 const proxyInFlight = new Map(); // url -> Promise<{ data, contentType }>
+
+// BYPASS DETECTOR ARCHITECTURE: Domain Cookie Jar
+// Keeps track of cookies set by each upstream domain so we can send them back on subsequent requests.
+// This simulates a real web browser session and bypasses cookie-based security checks (like Cloudflare/Bein Sports).
+const domainCookies = new Map(); // hostname -> cookie string
 
 // LOGICAL FIX: Proxy Cache Garbage Collector
 // Chunks that are never requested again must be actively deleted from RAM,
@@ -383,19 +399,15 @@ app.get('/proxy', async (req, res) => {
       // Strict 15s timeout for downloading anything (prevents hanging sockets)
       const timeoutId = setTimeout(() => controller.abort(), 15000); 
 
-      const parsedTarget = new URL(targetUrl);
-      const targetDomain = parsedTarget.origin;
+      try {
+        const parsedTarget = new URL(targetUrl);
+        const targetDomain = parsedTarget.origin;
+        const targetHostname = parsedTarget.hostname;
 
-      const response = await axios({
-        url: targetUrl,
-        method: 'GET',
-        signal: controller.signal,
-        responseType: 'stream', // ALWAYS stream to enforce memory limits manually
-        // Idea 5: Connection Multiplexing
-        httpAgent: keepAliveAgentHttp,
-        httpsAgent: keepAliveAgentHttps,
-        // Idea 2: Advanced Browser Fingerprint Spoofing
-        headers: {
+        // Retrieve saved cookies for this host to bypass security checks
+        const savedCookies = domainCookies.get(targetHostname);
+
+        const requestHeaders = {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
           'Accept': '*/*',
           'Accept-Language': 'en-US,en;q=0.9',
@@ -408,65 +420,90 @@ app.get('/proxy', async (req, res) => {
           'Sec-Fetch-Dest': 'empty',
           'Sec-Fetch-Mode': 'cors',
           'Sec-Fetch-Site': 'cross-site'
-        },
-        timeout: 12000,
-      });
+        };
 
-      if (timeoutId) clearTimeout(timeoutId);
-
-      const contentType = response.headers['content-type'] || '';
-      const contentLength = parseInt(response.headers['content-length'] || '0', 10);
-      const finalUrl = response.request?.res?.responseUrl || targetUrl;
-      const isPlaylist = isPlaylistUrl || contentType.includes('mpegurl') || contentType.includes('x-mpegURL');
-
-      // CRITICAL LOGICAL FIX: OOM Protection & 100% Caching
-      // Previously, chunks without a '.ts' extension bypassed deduplication, 
-      // opening a new upstream socket per user and crashing the server under load.
-      // Now, we buffer EVERYTHING up to a 20MB limit, allowing us to cache and deduplicate everything.
-      if (contentLength > 20 * 1024 * 1024) {
-        response.data.destroy();
-        throw new Error('File explicitly exceeds 20MB limit');
-      }
-
-      const chunks = [];
-      let totalSize = 0;
-      for await (const chunk of response.data) {
-        totalSize += chunk.length;
-        if (totalSize > 20 * 1024 * 1024) { // 20MB hard limit (protects against infinite streams)
-          response.data.destroy();
-          throw new Error('Stream exceeded 20MB buffer limit');
+        if (savedCookies) {
+          requestHeaders['Cookie'] = savedCookies;
         }
-        chunks.push(chunk);
+
+        const response = await axios({
+          url: targetUrl,
+          method: 'GET',
+          signal: controller.signal,
+          responseType: 'stream', // ALWAYS stream to enforce memory limits manually
+          httpAgent: keepAliveAgentHttp,
+          httpsAgent: keepAliveAgentHttps,
+          headers: requestHeaders,
+          timeout: 12000,
+        });
+
+        // ✅ Stream Error Listener: Prevent process crash on stream errors
+        response.data.on('error', (err) => {
+          console.error(`[Stream Error] Stream emitted error for ${targetUrl.substring(0, 60)}:`, err.message);
+        });
+
+        const contentType = response.headers['content-type'] || '';
+        const contentLength = parseInt(response.headers['content-length'] || '0', 10);
+        const finalUrl = response.request?.res?.responseUrl || targetUrl;
+        const isPlaylist = isPlaylistUrl || contentType.includes('mpegurl') || contentType.includes('x-mpegURL');
+
+        // Store cookies if the upstream server sets them
+        const setCookie = response.headers['set-cookie'];
+        if (setCookie) {
+          const cookieStr = Array.isArray(setCookie) ? setCookie.join('; ') : setCookie;
+          domainCookies.set(targetHostname, cookieStr);
+        }
+
+        // CRITICAL LOGICAL FIX: OOM Protection & 100% Caching
+        // Buffer everything up to 20MB limit
+        if (contentLength > 20 * 1024 * 1024) {
+          response.data.destroy();
+          throw new Error('File explicitly exceeds 20MB limit');
+        }
+
+        const chunks = [];
+        let totalSize = 0;
+        for await (const chunk of response.data) {
+          totalSize += chunk.length;
+          if (totalSize > 20 * 1024 * 1024) { // 20MB hard limit (protects against infinite streams)
+            response.data.destroy();
+            throw new Error('Stream exceeded 20MB buffer limit');
+          }
+          chunks.push(chunk);
+        }
+        
+        const buffer = Buffer.concat(chunks);
+
+        if (isPlaylist) {
+          const text = buffer.toString('utf8');
+          const rewritten = text.split('\n').map(line => {
+            const trimmed = line.trim();
+            if (!trimmed) return '';
+            if (trimmed.startsWith('#')) {
+              return trimmed.replace(/URI="([^"]+)"/g, (_, uri) => {
+                const abs = toAbsoluteUrl(uri, finalUrl);
+                return `URI="/proxy?url=${encodeURIComponent(abs)}&ptoken=${token}"`;
+              });
+            }
+            if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
+              return `/proxy?url=${encodeURIComponent(trimmed)}&ptoken=${token}`;
+            }
+            if (!trimmed.startsWith('#')) {
+              const abs = toAbsoluteUrl(trimmed, finalUrl);
+              return `/proxy?url=${encodeURIComponent(abs)}&ptoken=${token}`;
+            }
+            return trimmed;
+          }).join('\n');
+
+          return { data: rewritten, contentType, isPlaylist: true };
+        }
+
+        // It's a video chunk or key file
+        return { data: buffer, contentType, isPlaylist: false };
+      } finally {
+        // ✅ Ensure the timeout is cleared ONLY after the stream download finishes or fails
+        clearTimeout(timeoutId);
       }
-      
-      const buffer = Buffer.concat(chunks);
-
-      if (isPlaylist) {
-        const text = buffer.toString('utf8');
-        const rewritten = text.split('\n').map(line => {
-          const trimmed = line.trim();
-          if (!trimmed) return '';
-          if (trimmed.startsWith('#')) {
-            return trimmed.replace(/URI="([^"]+)"/g, (_, uri) => {
-              const abs = toAbsoluteUrl(uri, finalUrl);
-              return `URI="/proxy?url=${encodeURIComponent(abs)}&ptoken=${token}"`;
-            });
-          }
-          if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
-            return `/proxy?url=${encodeURIComponent(trimmed)}&ptoken=${token}`;
-          }
-          if (!trimmed.startsWith('#')) {
-            const abs = toAbsoluteUrl(trimmed, finalUrl);
-            return `/proxy?url=${encodeURIComponent(abs)}&ptoken=${token}`;
-          }
-          return trimmed;
-        }).join('\n');
-
-        return { data: rewritten, contentType, isPlaylist: true };
-      }
-
-      // It's a video chunk or key file
-      return { data: buffer, contentType, isPlaylist: false };
     })();
 
     // Store in-flight for EVERYTHING to guarantee deduplication
@@ -483,12 +520,21 @@ app.get('/proxy', async (req, res) => {
     res.set('Access-Control-Allow-Origin', '*');
 
     // For Playlists & Chunks, save to cache
-    const cacheTtl = result.isPlaylist ? 2000 : 15000; // 2s for m3u8, 15s for TS chunks
+    // Playlist cache gets a small random jitter (3000ms - 4000ms) to look natural/organic to upstream anti-bot systems
+    const cacheTtl = result.isPlaylist ? (3000 + Math.floor(Math.random() * 1000)) : 30000; // 3-4s for m3u8, 30s for TS chunks
     proxyCache.set(targetUrl, {
       data: result.data,
       contentType: result.contentType,
       expires: Date.now() + cacheTtl
     });
+
+    // Prevent cache bloat (OOM Protection): if cache size exceeds 150 items, remove the oldest item
+    if (proxyCache.size > 150) {
+      const oldestKey = proxyCache.keys().next().value;
+      if (oldestKey) {
+        proxyCache.delete(oldestKey);
+      }
+    }
 
     res.set('Cache-Control', 'public, max-age=2');
     return res.send(result.data);
@@ -515,7 +561,17 @@ function toAbsoluteUrl(uri, full) {
   }
 }
 
+// Global Exception Handlers to prevent process crash
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[Unhandled Rejection] at:', promise, 'reason:', reason);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('[Uncaught Exception] thrown:', err.message || err);
+});
+
 const PORT = process.env.PORT || 5050;
 server.listen(PORT, () => {
   console.log(`Proxy & Socket server running on port ${PORT}`);
 });
+
