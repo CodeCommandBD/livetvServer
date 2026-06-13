@@ -284,7 +284,7 @@ const proxyCache = new Map(); // url -> { data: Buffer|String, expires: number, 
 const proxyInFlight = new Map(); // url -> Promise<{ data, contentType }>
 
 app.get('/proxy', async (req, res) => {
-  const targetUrl = req.query.url;
+  let targetUrl = req.query.url;
   const token = req.query.ptoken; // Proxy token
   
   // CRITICAL SECURITY FIX: Query Parameter Type Injection DoS Protection
@@ -292,6 +292,12 @@ app.get('/proxy', async (req, res) => {
   // This causes targetUrl.substring() in the catch block to throw an Uncaught Exception,
   // instantly crashing the entire Node.js server! We MUST ensure it is a string.
   if (!targetUrl || typeof targetUrl !== 'string') return res.status(400).send('Valid URL string required');
+
+  // Strip dead/third-party CORS proxies from the URL
+  // Our backend proxy doesn't need them and they often cause 502 Bad Gateway errors
+  if (targetUrl.startsWith('https://cors-proxy.cooks.fyi/')) {
+    targetUrl = targetUrl.replace('https://cors-proxy.cooks.fyi/', '');
+  }
   
   // Server Kill Switch Check
   if (global.serverStatus === 'offline') {
