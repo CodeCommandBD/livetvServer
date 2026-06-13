@@ -704,6 +704,13 @@ setInterval(() => {
       auditRateLimit.delete(ip);
     }
   }
+  // Cleanup old view debounce entries (older than 15 mins)
+  const oldestAllowedView = now - 15 * 60 * 1000;
+  for (const [key, time] of viewDebounceLimit.entries()) {
+    if (time < oldestAllowedView) {
+      viewDebounceLimit.delete(key);
+    }
+  }
 }, 5 * 60 * 1000); // Run every 5 minutes
 
 // Audit Event Logging
@@ -755,14 +762,6 @@ router.post('/audit/event', async (req, res) => {
         return; // Silently drop duplicate view logic
       }
       viewDebounceLimit.set(viewKey, now);
-      
-      // Prevent memory leak by occasionally cleaning up old entries
-      if (viewDebounceLimit.size > 5000) {
-        const oldestAllowed = now - 15 * 60 * 1000;
-        for (const [key, time] of viewDebounceLimit.entries()) {
-          if (time < oldestAllowed) viewDebounceLimit.delete(key);
-        }
-      }
     }
     
     let location = 'Unknown Location';
@@ -963,9 +962,10 @@ router.get('/admin/ip-details/:ip', authenticate, async (req, res) => {
 // Admin: Get all unique visitors aggregated from audit logs
 router.get('/admin/visitors', authenticate, async (req, res) => {
   try {
+    const fiveDaysAgo = new Date(Date.now() - 5 * 24 * 60 * 60 * 1000);
     const visitors = await Audit.aggregate([
-      // Only include logs that have an IP address
-      { $match: { 'metadata.ip': { $exists: true, $ne: null } } },
+      // Only include logs that have an IP address and are within the last 5 days
+      { $match: { 'metadata.ip': { $exists: true, $ne: null }, timestamp: { $gte: fiveDaysAgo } } },
       
       // Group by IP address
       {

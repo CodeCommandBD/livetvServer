@@ -10,8 +10,8 @@ const AuditSchema = new mongoose.Schema({
   metadata: { type: mongoose.Schema.Types.Mixed }
 });
 
-// TTL Index: Auto-delete logs older than 30 days
-AuditSchema.index({ timestamp: 1 }, { expireAfterSeconds: 30 * 24 * 60 * 60 });
+// TTL Index: Auto-delete logs older than 5 days to prevent DB storage exhaustion
+AuditSchema.index({ timestamp: 1 }, { expireAfterSeconds: 5 * 24 * 60 * 60 });
 
 // ✅ Fix Bug: Sparse index on metadata.ip for fast IP-detail queries
 // 'sparse: true' means documents without metadata.ip are excluded from the index

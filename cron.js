@@ -288,14 +288,18 @@ const checkLinks = async () => {
           return 'unknown';
         }
         
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 8000);
+        
         const startPing = Date.now();
         const response = await axios.get(channel.url, { 
-          timeout: 8000,
+          signal: controller.signal,
           responseType: 'stream',
           headers: {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
           }
         });
+        clearTimeout(timeoutId);
         
         if (response.data && typeof response.data.destroy === 'function') {
           // ✅ Bug Fix 2: Attach error listener BEFORE destroy() to prevent

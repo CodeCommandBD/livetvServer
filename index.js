@@ -283,6 +283,18 @@ app.get('/ping', (req, res) => {
 const proxyCache = new Map(); // url -> { data: Buffer|String, expires: number, contentType: string }
 const proxyInFlight = new Map(); // url -> Promise<{ data, contentType }>
 
+// LOGICAL FIX: Proxy Cache Garbage Collector
+// Chunks that are never requested again must be actively deleted from RAM,
+// otherwise the Node.js process will eventually run out of memory (OOM) and crash.
+setInterval(() => {
+  const now = Date.now();
+  for (const [url, cached] of proxyCache.entries()) {
+    if (now > cached.expires) {
+      proxyCache.delete(url);
+    }
+  }
+}, 30000);
+
 app.get('/proxy', async (req, res) => {
   let targetUrl = req.query.url;
   const token = req.query.ptoken; // Proxy token
@@ -365,9 +377,16 @@ app.get('/proxy', async (req, res) => {
       // Playlists can be stream or string, but we read them into string anyway.
       const shouldBuffer = isChunkUrl; 
 
+      const controller = new AbortController();
+      let timeoutId;
+      if (shouldBuffer) {
+        timeoutId = setTimeout(() => controller.abort(), 15000); // Strict 15s timeout for downloading chunks
+      }
+
       const response = await axios({
         url: targetUrl,
         method: 'GET',
+        signal: controller.signal,
         responseType: shouldBuffer ? 'arraybuffer' : 'stream',
         headers: {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
@@ -377,6 +396,8 @@ app.get('/proxy', async (req, res) => {
         },
         timeout: 12000,
       });
+
+      if (timeoutId) clearTimeout(timeoutId);
 
       const contentType = response.headers['content-type'] || '';
       const finalUrl = response.request?.res?.responseUrl || targetUrl;
