@@ -534,12 +534,17 @@ router.get('/admin/channels', authenticate, async (req, res) => {
       ];
     }
     
+    // Hide banned (soft-deleted) channels by default in the admin panel
     if (status !== 'all') {
       if (status === 'live') {
-        query.status = { $ne: 'dead' };
+        query.status = { $nin: ['dead', 'banned'] };
       } else if (status === 'dead') {
         query.status = 'dead';
+      } else if (status === 'banned') {
+        query.status = 'banned';
       }
+    } else {
+      query.status = { $ne: 'banned' };
     }
 
     const skip = (page - 1) * limit;
