@@ -379,16 +379,9 @@ app.get('/proxy', async (req, res) => {
 
     // 3. We are the first! Start the fetch.
     const fetchPromise = (async () => {
-      // If it's a known chunk (like .ts), we use 'arraybuffer' so we can cache it in RAM.
-      // If it's an unknown URL (could be an endless RTMP stream), we MUST use 'stream' to avoid OOM.
-      // Playlists can be stream or string, but we read them into string anyway.
-      const shouldBuffer = isChunkUrl; 
-
       const controller = new AbortController();
-      let timeoutId;
-      if (shouldBuffer) {
-        timeoutId = setTimeout(() => controller.abort(), 15000); // Strict 15s timeout for downloading chunks
-      }
+      // Strict 15s timeout for downloading anything (prevents hanging sockets)
+      const timeoutId = setTimeout(() => controller.abort(), 15000); 
 
       const parsedTarget = new URL(targetUrl);
       const targetDomain = parsedTarget.origin;
@@ -397,7 +390,7 @@ app.get('/proxy', async (req, res) => {
         url: targetUrl,
         method: 'GET',
         signal: controller.signal,
-        responseType: shouldBuffer ? 'arraybuffer' : 'stream',
+        responseType: 'stream', // ALWAYS stream to enforce memory limits manually
         // Idea 5: Connection Multiplexing
         httpAgent: keepAliveAgentHttp,
         httpsAgent: keepAliveAgentHttps,
@@ -422,25 +415,34 @@ app.get('/proxy', async (req, res) => {
       if (timeoutId) clearTimeout(timeoutId);
 
       const contentType = response.headers['content-type'] || '';
+      const contentLength = parseInt(response.headers['content-length'] || '0', 10);
       const finalUrl = response.request?.res?.responseUrl || targetUrl;
       const isPlaylist = isPlaylistUrl || contentType.includes('mpegurl') || contentType.includes('x-mpegURL');
 
-      if (isPlaylist) {
-        let text = '';
-        if (shouldBuffer) {
-          text = response.data.toString('utf8');
-        } else {
-          let totalSize = 0;
-          for await (const chunk of response.data) {
-            totalSize += chunk.length;
-            if (totalSize > 5 * 1024 * 1024) {
-              response.data.destroy();
-              throw new Error('Playlist exceeded 5MB limit');
-            }
-            text += chunk.toString('utf8');
-          }
-        }
+      // CRITICAL LOGICAL FIX: OOM Protection & 100% Caching
+      // Previously, chunks without a '.ts' extension bypassed deduplication, 
+      // opening a new upstream socket per user and crashing the server under load.
+      // Now, we buffer EVERYTHING up to a 20MB limit, allowing us to cache and deduplicate everything.
+      if (contentLength > 20 * 1024 * 1024) {
+        response.data.destroy();
+        throw new Error('File explicitly exceeds 20MB limit');
+      }
 
+      const chunks = [];
+      let totalSize = 0;
+      for await (const chunk of response.data) {
+        totalSize += chunk.length;
+        if (totalSize > 20 * 1024 * 1024) { // 20MB hard limit (protects against infinite streams)
+          response.data.destroy();
+          throw new Error('Stream exceeded 20MB buffer limit');
+        }
+        chunks.push(chunk);
+      }
+      
+      const buffer = Buffer.concat(chunks);
+
+      if (isPlaylist) {
+        const text = buffer.toString('utf8');
         const rewritten = text.split('\n').map(line => {
           const trimmed = line.trim();
           if (!trimmed) return '';
@@ -460,53 +462,25 @@ app.get('/proxy', async (req, res) => {
           return trimmed;
         }).join('\n');
 
-        return { data: rewritten, contentType, isStream: false, isPlaylist: true };
+        return { data: rewritten, contentType, isPlaylist: true };
       }
 
-      if (shouldBuffer) {
-        return { data: response.data, contentType, isStream: false, isPlaylist: false };
-      }
-
-      // It's an endless stream or unknown binary. We cannot cache it.
-      return { data: response.data, contentType, isStream: true, isPlaylist: false };
+      // It's a video chunk or key file
+      return { data: buffer, contentType, isPlaylist: false };
     })();
 
-    // Store in-flight ONLY if we can cache it (Playlists and Chunks)
-    const canCache = isPlaylistUrl || isChunkUrl;
-    if (canCache) {
-      proxyInFlight.set(targetUrl, fetchPromise);
-    }
+    // Store in-flight for EVERYTHING to guarantee deduplication
+    proxyInFlight.set(targetUrl, fetchPromise);
 
     let result;
     try {
       result = await fetchPromise;
     } finally {
-      if (canCache) proxyInFlight.delete(targetUrl);
+      proxyInFlight.delete(targetUrl);
     }
 
     res.set('Content-Type', result.contentType);
     res.set('Access-Control-Allow-Origin', '*');
-
-    // 4. Return Data & Populate Cache
-    if (result.isStream) {
-      // Endless stream. Pipe directly, no caching.
-      res.set('Cache-Control', 'no-cache');
-      result.data.pipe(res);
-      
-      res.on('close', () => {
-        if (!res.writableEnded && result.data && typeof result.data.destroy === 'function') {
-          result.data.on('error', () => {});
-          result.data.destroy();
-        }
-      });
-      res.on('error', () => {
-        if (result.data && typeof result.data.destroy === 'function') {
-          result.data.on('error', () => {});
-          result.data.destroy();
-        }
-      });
-      return;
-    }
 
     // For Playlists & Chunks, save to cache
     const cacheTtl = result.isPlaylist ? 2000 : 15000; // 2s for m3u8, 15s for TS chunks
