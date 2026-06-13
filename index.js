@@ -324,8 +324,10 @@ const keepAliveAgentHttps = new https.Agent({
 
 // LOGICAL FIX: Proxy Deduplication & Caching
 // Prevents upstream IPTV servers from banning our IP when multiple users
-// watch the same channel. We cache playlists (.m3u8) with jitter and chunks (.ts) for 30s.
+// watch the same channel. We cache playlists (.m3u8) with jitter and chunks (.ts).
 const proxyCache = new Map(); // url -> { data: Buffer|String, expires: number, contentType: string }
+let proxyCacheBytes = 0;
+const MAX_CACHE_BYTES = 100 * 1024 * 1024; // 100 MB hard limit for RAM to prevent OOM crashes
 const proxyInFlight = new Map(); // url -> Promise<{ data, contentType }>
 
 // BYPASS DETECTOR ARCHITECTURE: Domain Cookie Jar
@@ -340,10 +342,11 @@ setInterval(() => {
   const now = Date.now();
   for (const [url, cached] of proxyCache.entries()) {
     if (now > cached.expires) {
+      proxyCacheBytes -= (cached.data.length || 0);
       proxyCache.delete(url);
     }
   }
-}, 30000);
+}, 5000); // Check every 5 seconds to aggressively free RAM
 
 app.get('/proxy', proxyLimiter, async (req, res) => {
   let targetUrl = req.query.url;
@@ -554,17 +557,24 @@ app.get('/proxy', proxyLimiter, async (req, res) => {
 
     // For Playlists & Chunks, save to cache
     // Playlist cache gets a small random jitter (3000ms - 4000ms) to look natural/organic to upstream anti-bot systems
-    const cacheTtl = result.isPlaylist ? (3000 + Math.floor(Math.random() * 1000)) : 30000; // 3-4s for m3u8, 30s for TS chunks
+    const cacheTtl = result.isPlaylist ? (3000 + Math.floor(Math.random() * 1000)) : 15000; // 3-4s for m3u8, 15s for TS chunks (reduced to free RAM faster)
+    
+    if (proxyCache.has(targetUrl)) {
+      proxyCacheBytes -= (proxyCache.get(targetUrl).data.length || 0);
+    }
+
     proxyCache.set(targetUrl, {
       data: result.data,
       contentType: result.contentType,
       expires: Date.now() + cacheTtl
     });
+    proxyCacheBytes += (result.data.length || 0);
 
-    // Prevent cache bloat (OOM Protection): if cache size exceeds 150 items, remove the oldest item
-    if (proxyCache.size > 150) {
+    // Strict RAM Limit Enforcement: Delete oldest chunks if we exceed 100MB
+    while (proxyCacheBytes > MAX_CACHE_BYTES && proxyCache.size > 0) {
       const oldestKey = proxyCache.keys().next().value;
       if (oldestKey) {
+        proxyCacheBytes -= (proxyCache.get(oldestKey).data.length || 0);
         proxyCache.delete(oldestKey);
       }
     }
