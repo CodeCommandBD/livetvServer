@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const http = require('http');
+const https = require('https');
 const { Server } = require('socket.io');
 const connectDB = require('./config/db');
 
@@ -277,6 +278,12 @@ app.get('/ping', (req, res) => {
   res.json({ status: 'ok', time: new Date().toISOString() });
 });
 
+// LOGICAL FIX: Connection Multiplexing Agents (Anti-Block Architecture)
+// Instead of creating a new TCP socket for every video chunk, we keep a pool of open sockets.
+// This prevents upstream servers (like Bein Sports) from banning our IP due to rapid socket creation.
+const keepAliveAgentHttp = new http.Agent({ keepAlive: true, maxSockets: 100, keepAliveMsecs: 30000 });
+const keepAliveAgentHttps = new https.Agent({ keepAlive: true, maxSockets: 100, keepAliveMsecs: 30000 });
+
 // LOGICAL FIX: Proxy Deduplication & Caching
 // Prevents upstream IPTV servers from banning our IP when multiple users
 // watch the same channel. We cache playlists (.m3u8) for 2s and chunks (.ts) for 15s.
@@ -383,16 +390,31 @@ app.get('/proxy', async (req, res) => {
         timeoutId = setTimeout(() => controller.abort(), 15000); // Strict 15s timeout for downloading chunks
       }
 
+      const parsedTarget = new URL(targetUrl);
+      const targetDomain = parsedTarget.origin;
+
       const response = await axios({
         url: targetUrl,
         method: 'GET',
         signal: controller.signal,
         responseType: shouldBuffer ? 'arraybuffer' : 'stream',
+        // Idea 5: Connection Multiplexing
+        httpAgent: keepAliveAgentHttp,
+        httpsAgent: keepAliveAgentHttps,
+        // Idea 2: Advanced Browser Fingerprint Spoofing
         headers: {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
           'Accept': '*/*',
           'Accept-Language': 'en-US,en;q=0.9',
           'Connection': 'keep-alive',
+          'Referer': targetDomain + '/',
+          'Origin': targetDomain,
+          'Sec-Ch-Ua': '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+          'Sec-Ch-Ua-Mobile': '?0',
+          'Sec-Ch-Ua-Platform': '"Windows"',
+          'Sec-Fetch-Dest': 'empty',
+          'Sec-Fetch-Mode': 'cors',
+          'Sec-Fetch-Site': 'cross-site'
         },
         timeout: 12000,
       });
