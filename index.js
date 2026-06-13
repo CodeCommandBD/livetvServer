@@ -5,12 +5,31 @@ const axios = require('axios');
 const http = require('http');
 const https = require('https');
 const { Server } = require('socket.io');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 const connectDB = require('./config/db');
 
 // Connect to MongoDB
 connectDB();
 
 const app = express();
+
+// Helmet Security Headers (Disabling CSP since it is a pure backend API proxy)
+app.use(helmet({ contentSecurityPolicy: false }));
+app.disable('x-powered-by');
+
+// Rate Limiting on proxy: Max 300 requests per minute per IP to prevent spamming
+const proxyLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 300,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => {
+    const forwarded = req.headers['x-forwarded-for'];
+    return forwarded ? forwarded.split(',')[0].trim() : req.socket.remoteAddress;
+  },
+  handler: (req, res) => res.status(429).send('Too many requests'),
+});
 
 const allowedOrigins = [
   'https://nexplay-tv.vercel.app',
@@ -247,6 +266,14 @@ global.getActiveUsersCount = () => {
   return uniqueIps.size;
 };
 
+global.getObfuscatedUserCount = () => {
+  const real = global.getActiveUsersCount();
+  if (real === 0) return 0;
+  // ±15% random noise, minimum 1
+  const noise = 0.85 + Math.random() * 0.30;
+  return Math.max(1, Math.round(real * noise));
+};
+
 global.getChannelBreakdown = () => {
   const breakdown = {};
   for (const [clientId, session] of global.activeSessions.entries()) {
@@ -318,7 +345,7 @@ setInterval(() => {
   }
 }, 30000);
 
-app.get('/proxy', async (req, res) => {
+app.get('/proxy', proxyLimiter, async (req, res) => {
   let targetUrl = req.query.url;
   const token = req.query.ptoken; // Proxy token
   
@@ -346,8 +373,9 @@ app.get('/proxy', async (req, res) => {
     activeIps.set(userIP, Date.now());
   }
 
-  // Basic Anti-Theft: Require a static secret token from the frontend
-  if (token !== 'nexplay_secure_play_2026') {
+  // Basic Anti-Theft: Require a static secret token from the environment/frontend
+  const expectedToken = process.env.PROXY_TOKEN || 'nexplay_secure_play_2026';
+  if (!token || token !== expectedToken) {
     return res.status(403).send('Forbidden: Invalid Proxy Token. Hotlinking is not allowed.');
   }
 
@@ -451,6 +479,11 @@ app.get('/proxy', async (req, res) => {
         const setCookie = response.headers['set-cookie'];
         if (setCookie) {
           const cookieStr = Array.isArray(setCookie) ? setCookie.join('; ') : setCookie;
+          // Fix 3: Prevent memory leak in domainCookies Map
+          if (domainCookies.size >= 500) {
+            const oldestKey = domainCookies.keys().next().value;
+            domainCookies.delete(oldestKey);
+          }
           domainCookies.set(targetHostname, cookieStr);
         }
 
