@@ -8,6 +8,9 @@ const { Server } = require('socket.io');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const connectDB = require('./config/db');
+const crypto = require('crypto');
+
+const TOKEN_SECRET = process.env.PROXY_TOKEN_SECRET || 'nexplay_dynamic_secret_key_2026';
 
 // Connect to MongoDB
 connectDB();
@@ -84,6 +87,13 @@ io.on('connection', (socket) => {
       }
     });
     socket.join(channelName);
+    
+    // Architecturally track active viewing sessions for the Auto Link Checker
+    global.activeSessions.set(socket.id, { 
+      channelName, 
+      ip: socket.handshake.address,
+      lastSeen: Date.now() 
+    });
   });
   
   socket.on('send_reaction', (data) => {
@@ -178,6 +188,9 @@ io.on('connection', (socket) => {
       });
       partyUsers.delete(socket.id);
     }
+    
+    // Cleanup active session
+    global.activeSessions.delete(socket.id);
   });
 });
 
@@ -305,6 +318,15 @@ app.get('/ping', (req, res) => {
   res.json({ status: 'ok', time: new Date().toISOString() });
 });
 
+// Deep Architecture: Dynamic Stream Token Generation
+app.get('/api/stream-token', (req, res) => {
+  // Generate a token valid for 3 hours (Better for Football/T20 matches)
+  const expiresAt = Date.now() + 3 * 60 * 60 * 1000;
+  const hash = crypto.createHmac('sha256', TOKEN_SECRET).update(expiresAt.toString()).digest('hex');
+  const token = `${expiresAt}.${hash}`;
+  res.json({ token });
+});
+
 // LOGICAL FIX: Connection Multiplexing Agents (Anti-Block Architecture)
 // Instead of creating a new TCP socket for every video chunk, we keep a pool of open sockets.
 // This prevents upstream servers (like Bein Sports) from banning our IP due to rapid socket creation.
@@ -376,10 +398,19 @@ app.get('/proxy', proxyLimiter, async (req, res) => {
     activeIps.set(userIP, Date.now());
   }
 
-  // Basic Anti-Theft: Require a static secret token from the environment/frontend
-  const expectedToken = process.env.PROXY_TOKEN || 'nexplay_secure_play_2026';
-  if (!token || token !== expectedToken) {
-    return res.status(403).send('Forbidden: Invalid Proxy Token. Hotlinking is not allowed.');
+  // Deep Architecture Fix: Dynamic Token Verification (HMAC-SHA256)
+  if (!token || !token.includes('.')) {
+    return res.status(403).send('Forbidden: Invalid or missing token format.');
+  }
+  
+  const [timestamp, hash] = token.split('.');
+  if (Date.now() > parseInt(timestamp, 10)) {
+    return res.status(403).send('Forbidden: Token has expired. Please refresh the page.');
+  }
+  
+  const expectedHash = crypto.createHmac('sha256', TOKEN_SECRET).update(timestamp).digest('hex');
+  if (hash !== expectedHash) {
+    return res.status(403).send('Forbidden: Invalid Token Signature. Hotlinking blocked.');
   }
 
   try {
@@ -422,7 +453,7 @@ app.get('/proxy', proxyLimiter, async (req, res) => {
         res.set('Cache-Control', 'public, max-age=2');
         return res.send(result.data);
       } catch (err) {
-        // Fall through and try again if the in-flight failed
+        console.warn(`[Proxy] In-flight deduplication failed for ${targetUrl.substring(0, 50)}... falling through to retry:`, err.message);
       }
     }
 
@@ -431,6 +462,12 @@ app.get('/proxy', proxyLimiter, async (req, res) => {
       const controller = new AbortController();
       // Strict 15s timeout for downloading anything (prevents hanging sockets)
       const timeoutId = setTimeout(() => controller.abort(), 15000); 
+
+      // CRITICAL ARCHITECTURAL FIX: Bandwidth & Memory Leak Prevention
+      // If the user's browser disconnects midway through downloading a chunk,
+      // abort the upstream Axios request immediately to save Server RAM & Bandwidth.
+      const onClientDisconnect = () => controller.abort();
+      req.on('close', onClientDisconnect);
 
       try {
         const parsedTarget = new URL(targetUrl);
@@ -552,6 +589,8 @@ app.get('/proxy', proxyLimiter, async (req, res) => {
       } finally {
         // ✅ Ensure the timeout is cleared ONLY after the stream download finishes or fails
         clearTimeout(timeoutId);
+        // Remove the close listener to avoid memory leaks on the request object
+        req.off('close', onClientDisconnect);
       }
     })();
 
@@ -629,11 +668,18 @@ process.on('unhandledRejection', (reason, promise) => {
 });
 
 process.on('uncaughtException', (err) => {
-  console.error('[Uncaught Exception] thrown:', err.message || err);
-});
-
 const PORT = process.env.PORT || 5050;
 server.listen(PORT, () => {
-  console.log(`Proxy & Socket server running on port ${PORT}`);
+  console.log(`Live TV Server running on port ${PORT}`);
 });
 
+// CRITICAL ARCHITECTURAL FIX: Global Error Boundary
+// Prevent the entire Node.js server from crashing due to unhandled promise rejections
+// in background cron jobs or third-party API calls.
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[Global Error Boundary] Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('[Global Error Boundary] Uncaught Exception:', err);
+});
