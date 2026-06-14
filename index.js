@@ -662,17 +662,6 @@ function toAbsoluteUrl(uri, full) {
   }
 }
 
-// Global Exception Handlers to prevent process crash
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('[Unhandled Rejection] at:', promise, 'reason:', reason);
-});
-
-process.on('uncaughtException', (err) => {
-const PORT = process.env.PORT || 5050;
-server.listen(PORT, () => {
-  console.log(`Live TV Server running on port ${PORT}`);
-});
-
 // CRITICAL ARCHITECTURAL FIX: Global Error Boundary
 // Prevent the entire Node.js server from crashing due to unhandled promise rejections
 // in background cron jobs or third-party API calls.
@@ -682,4 +671,9 @@ process.on('unhandledRejection', (reason, promise) => {
 
 process.on('uncaughtException', (err) => {
   console.error('[Global Error Boundary] Uncaught Exception:', err);
+});
+
+const PORT = process.env.PORT || 5050;
+server.listen(PORT, () => {
+  console.log(`Live TV Server running on port ${PORT}`);
 });
