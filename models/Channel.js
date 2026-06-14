@@ -10,6 +10,8 @@ const ChannelSchema = new mongoose.Schema({
   group: { type: String, default: '' },
   url: { type: String, required: true },
   status: { type: String, default: 'live' },
+  drmKeyId: { type: String, default: '' },
+  drmKey: { type: String, default: '' },
   verified_at: { type: Date, default: Date.now },
   status_code: { type: Number, default: 200 },
   content_type: { type: String, default: 'application/vnd.apple.mpegurl' },

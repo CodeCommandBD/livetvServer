@@ -311,13 +311,13 @@ app.get('/ping', (req, res) => {
 // Added socket timeout of 15s to automatically release hung/silent sockets.
 const keepAliveAgentHttp = new http.Agent({ 
   keepAlive: true, 
-  maxSockets: 150, 
+  maxSockets: Infinity, 
   keepAliveMsecs: 30000,
   timeout: 15000 
 });
 const keepAliveAgentHttps = new https.Agent({ 
   keepAlive: true, 
-  maxSockets: 150, 
+  maxSockets: Infinity, 
   keepAliveMsecs: 30000,
   timeout: 15000 
 });
@@ -396,9 +396,11 @@ app.get('/proxy', proxyLimiter, async (req, res) => {
 
     const isPlaylistUrl = targetUrl.includes('.m3u8') || targetUrl.includes('mpegurl');
     const isChunkUrl = targetUrl.includes('.ts') || targetUrl.includes('.m4s') || targetUrl.includes('.vtt');
+    const hasRange = !!req.headers['range'];
 
     // 1. Check Cache
-    if (proxyCache.has(targetUrl)) {
+    // Deep Architecture Fix: BYPASS cache for Range requests to prevent cross-user data corruption
+    if (!hasRange && proxyCache.has(targetUrl)) {
       const cached = proxyCache.get(targetUrl);
       if (Date.now() < cached.expires) {
         res.set('Content-Type', cached.contentType);
@@ -412,7 +414,7 @@ app.get('/proxy', proxyLimiter, async (req, res) => {
 
     // 2. Check In-Flight Deduplication
     // If another user is CURRENTLY downloading this exact file, wait for their promise!
-    if (proxyInFlight.has(targetUrl)) {
+    if (!hasRange && proxyInFlight.has(targetUrl)) {
       try {
         const result = await proxyInFlight.get(targetUrl);
         res.set('Content-Type', result.contentType);
@@ -453,6 +455,12 @@ app.get('/proxy', proxyLimiter, async (req, res) => {
           'Sec-Fetch-Site': 'cross-site'
         };
 
+        // Deep Architecture Fix: Forward HTTP Range Header for DASH Seeking
+        // Without this, the proxy will download the entire 5GB file instead of 1KB chunk!
+        if (req.headers['range']) {
+          requestHeaders['Range'] = req.headers['range'];
+        }
+
         if (savedCookies) {
           requestHeaders['Cookie'] = savedCookies;
         }
@@ -476,7 +484,12 @@ app.get('/proxy', proxyLimiter, async (req, res) => {
         const contentType = response.headers['content-type'] || '';
         const contentLength = parseInt(response.headers['content-length'] || '0', 10);
         const finalUrl = response.request?.res?.responseUrl || targetUrl;
+        const statusCode = response.status;
+        const contentRange = response.headers['content-range'];
+        const acceptRanges = response.headers['accept-ranges'];
+
         const isPlaylist = isPlaylistUrl || contentType.includes('mpegurl') || contentType.includes('x-mpegURL');
+        const isManifest = isPlaylist || targetUrl.includes('.mpd') || contentType.includes('dash+xml');
 
         // Store cookies if the upstream server sets them
         const setCookie = response.headers['set-cookie'];
@@ -531,11 +544,11 @@ app.get('/proxy', proxyLimiter, async (req, res) => {
             return trimmed;
           }).join('\n');
 
-          return { data: rewritten, contentType, isPlaylist: true };
+          return { data: rewritten, contentType, isPlaylist: true, isManifest: true, statusCode, contentRange, acceptRanges };
         }
 
-        // It's a video chunk or key file
-        return { data: buffer, contentType, isPlaylist: false };
+        // It's a video chunk, key file, or XML manifest
+        return { data: buffer, contentType, isPlaylist: false, isManifest, statusCode, contentRange, acceptRanges };
       } finally {
         // ✅ Ensure the timeout is cleared ONLY after the stream download finishes or fails
         clearTimeout(timeoutId);
@@ -543,7 +556,9 @@ app.get('/proxy', proxyLimiter, async (req, res) => {
     })();
 
     // Store in-flight for EVERYTHING to guarantee deduplication
-    proxyInFlight.set(targetUrl, fetchPromise);
+    if (!hasRange) {
+      proxyInFlight.set(targetUrl, fetchPromise);
+    }
 
     let result;
     try {
@@ -554,21 +569,25 @@ app.get('/proxy', proxyLimiter, async (req, res) => {
 
     res.set('Content-Type', result.contentType);
     res.set('Access-Control-Allow-Origin', '*');
+    if (result.acceptRanges) res.set('Accept-Ranges', result.acceptRanges);
+    if (result.contentRange) res.set('Content-Range', result.contentRange);
 
     // For Playlists & Chunks, save to cache
     // Playlist cache gets a small random jitter (3000ms - 4000ms) to look natural/organic to upstream anti-bot systems
-    const cacheTtl = result.isPlaylist ? (3000 + Math.floor(Math.random() * 1000)) : 15000; // 3-4s for m3u8, 15s for TS chunks (reduced to free RAM faster)
-    
-    if (proxyCache.has(targetUrl)) {
-      proxyCacheBytes -= (proxyCache.get(targetUrl).data.length || 0);
-    }
+    if (!hasRange) {
+      const cacheTtl = result.isManifest ? (3000 + Math.floor(Math.random() * 1000)) : 15000; // 3-4s for manifests, 15s for chunks
+      
+      if (proxyCache.has(targetUrl)) {
+        proxyCacheBytes -= (proxyCache.get(targetUrl).data.length || 0);
+      }
 
-    proxyCache.set(targetUrl, {
-      data: result.data,
-      contentType: result.contentType,
-      expires: Date.now() + cacheTtl
-    });
-    proxyCacheBytes += (result.data.length || 0);
+      proxyCache.set(targetUrl, {
+        data: result.data,
+        contentType: result.contentType,
+        expires: Date.now() + cacheTtl
+      });
+      proxyCacheBytes += (result.data.length || 0);
+    }
 
     // Strict RAM Limit Enforcement: Delete oldest chunks if we exceed 100MB
     while (proxyCacheBytes > MAX_CACHE_BYTES && proxyCache.size > 0) {
@@ -580,7 +599,7 @@ app.get('/proxy', proxyLimiter, async (req, res) => {
     }
 
     res.set('Cache-Control', 'public, max-age=2');
-    return res.send(result.data);
+    return res.status(result.statusCode || 200).send(result.data);
 
   } catch (err) {
     const status = err.response?.status || 502;
