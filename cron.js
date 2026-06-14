@@ -39,7 +39,7 @@ const syncFromGitHub = async () => {
   console.log('[Cron] Starting Dynamic Sync...');
   try {
     // Load only enabled sources from the database (Dynamic!)
-    const sources = await SyncSource.find({ enabled: true });
+    const sources = await SyncSource.find({ enabled: true }).lean();
 
     if (sources.length === 0) {
       console.log('[Cron] No enabled sync sources found. Skipping.');
@@ -152,7 +152,7 @@ const syncFromGitHub = async () => {
     console.log(`[Cron] ${allNewChannels.length} total → ${dedupedChannels.length} unique after dedup.`);
 
     // Load all existing DB channels into a Map for O(1) lookup
-    const existingChannels = await Channel.find({});
+    const existingChannels = await Channel.find({}).lean();
     const channelMap = new Map();
     for (const c of existingChannels) channelMap.set(c.name, c);
 

@@ -40,6 +40,16 @@ const authenticate = (req, res, next) => {
 // Brute-Force Protection: Track failed login attempts per IP
 const loginAttempts = new Map();
 
+// Clean up old login attempts to prevent memory leaks
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, attempt] of loginAttempts.entries()) {
+    if (now - attempt.time > 15 * 60 * 1000) {
+      loginAttempts.delete(ip);
+    }
+  }
+}, 5 * 60 * 1000);
+
 router.post('/admin/login', async (req, res) => {
   try {
     const forwardedFor = req.headers['x-forwarded-for'];
@@ -208,7 +218,7 @@ router.post('/automation/check-links', authenticate, async (req, res) => {
 // GET all sync sources
 router.get('/sync-sources', authenticate, async (req, res) => {
   try {
-    const sources = await SyncSource.find({}).sort({ createdAt: -1 });
+    const sources = await SyncSource.find({}).sort({ createdAt: -1 }).lean();
     res.json(sources);
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
@@ -341,7 +351,7 @@ router.get('/matches', async (req, res) => {
     // LOGICAL FIX: Cap at 500 to prevent OOM crash if there are thousands of historical matches
     const limit = req.query.all === 'true' ? 500 : 0; 
     const sortOrder = req.query.all === 'true' ? -1 : 1;
-    const matches = await Match.find(query).sort({ startTime: sortOrder }).limit(limit);
+    const matches = await Match.find(query).sort({ startTime: sortOrder }).limit(limit).lean();
     res.json(matches);
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
@@ -446,7 +456,7 @@ router.get('/home-sections', async (req, res) => {
         console.error('Redis GET error (homeSections):', redisErr.message);
       }
     }
-    const setting = await Setting.findOne({ key: 'homeSections' });
+    const setting = await Setting.findOne({ key: 'homeSections' }).lean();
     const defaultSections = { cricket: [], football: [], watchRecommended: [], watchFootball: [], watchCricket: [] };
     const sections = setting ? { ...defaultSections, ...setting.value } : defaultSections;
     if (redis) {
@@ -503,7 +513,7 @@ router.get('/channels', async (req, res) => {
       }
     }
     
-    const channels = await Channel.find({ status: { $ne: 'banned' } }).select('-__v');
+    const channels = await Channel.find({ status: { $ne: 'banned' } }).sort({ _id: -1 }).select('-__v').lean();
     
     if (redis) {
       try {
@@ -549,7 +559,7 @@ router.get('/admin/channels', authenticate, async (req, res) => {
     const skip = (page - 1) * limit;
 
     const [channels, total] = await Promise.all([
-      Channel.find(query).select('-__v').sort({ _id: -1 }).skip(skip).limit(limit),
+      Channel.find(query).select('-__v').sort({ _id: -1 }).skip(skip).limit(limit).lean(),
       Channel.countDocuments(query)
     ]);
 
@@ -857,11 +867,12 @@ router.post('/stream/heartbeat', (req, res) => {
 // Admin: Get dashboard stats
 router.get('/admin/stats', authenticate, async (req, res) => {
   try {
-    const totalChannels = await Channel.countDocuments();
-    const totalViews = await Audit.countDocuments({ type: 'PLAY_START' });
-    const totalErrors = await Audit.countDocuments({ type: 'PLAY_ERROR' });
-
-    const deadLinksEstimate = await Channel.countDocuments({ status: 'dead' });
+    const [totalChannels, totalViews, totalErrors, deadLinksEstimate] = await Promise.all([
+      Channel.countDocuments(),
+      Audit.countDocuments({ type: 'PLAY_START' }),
+      Audit.countDocuments({ type: 'PLAY_ERROR' }),
+      Channel.countDocuments({ status: 'dead' })
+    ]);
 
     // Total Reactions across all channels
     const totalReactionsRaw = await Channel.aggregate([{ $group: { _id: null, total: { $sum: "$reactionsCount" } } }]);
